@@ -2,8 +2,8 @@ fastapi
 pydantic
 google-generativeai
 requests
-pinecone-client
-pinecone-plugins
+pinecone
+pinecone
 boto3
 langchain
 langchain-core
@@ -13,3 +13,4 @@ redis
 supabase
 python-dotenv
 langchain-google-genai
+langchain[mistralai]
