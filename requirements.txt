@@ -1,0 +1,15 @@
+fastapi
+pydantic
+google-generativeai
+requests
+pinecone-client
+pinecone-plugins
+boto3
+langchain
+langchain-core
+paramiko
+PyJWT
+redis
+supabase
+python-dotenv
+langchain-google-genai
