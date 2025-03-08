@@ -14,3 +14,4 @@ supabase
 python-dotenv
 langchain-google-genai
 langchain[mistralai]
+langchain-community
