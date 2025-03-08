@@ -6,7 +6,6 @@ import google.generativeai as genai
 import requests
 import subprocess
 from pinecone import Pinecone
-from pinecone_plugins.assistant.models.chat import Message
 import re
 import boto3
 from botocore.exceptions import ClientError
