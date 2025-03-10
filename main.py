@@ -124,7 +124,8 @@ class Incident(BaseModel):
     state: Union[str, None]
     inc_number: Union[str, None]
 
-
+class Mesage(BaseModel):
+    content: str
 
 # def powerStatus(Aws: Aws):
 #     model = genai.GenerativeModel("gemini-1.5-flash")
@@ -858,9 +859,10 @@ llm_with_tools = model.bind_tools(tools)
 tool_mapping = {"create_incident": create_incident, "update_incident": update_incident}
 
 @app.post("/chat")
-def chat(message:str):
+def chat(message:Mesage):
+
     gemini = genai.GenerativeModel("gemini-2.0-flash-exp")
-    messages=[HumanMessage(message)]
+    messages=[HumanMessage(message.content)]
     res=llm_with_tools.invoke(messages)
     messages.append(res)
     for tool_call in res.tool_calls:
