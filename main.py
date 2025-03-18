@@ -43,6 +43,7 @@ from typing import Annotated
 app = FastAPI()
 security = HTTPBearer()
 from langchain_google_genai import ChatGoogleGenerativeAI
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
 import getpass
@@ -50,6 +51,7 @@ from langchain_core.tools import tool
 from langchain.agents import initialize_agent, Tool
 from langchain.memory import ConversationBufferMemory
 from langchain.schema import HumanMessage
+from tavily import TavilyClient
 load_dotenv()
 genai.configure(api_key=os.getenv('Gemini_Api_Key'))
 pc = Pinecone(api_key="pcsk_WixB2_C6B8eWdCN9WaRuugDbqaGb5tRPVG8K8mpk7fWux2UesABstJxMMEcw8Smsz57eU")
@@ -66,7 +68,7 @@ session = boto3.Session(
 )
 
 from langchain.chat_models import init_chat_model
-model = init_chat_model("mistral-small-latest", model_provider="mistralai")
+model = init_chat_model("mistral-large-latest", model_provider="mistralai")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,6 +88,85 @@ mkew+iKms63o1+K6p16OGX3DR+WYnjCWOf6SxsTWOxTCBzxow+m693Afg3stBLR3
 ZQIDAQAB
 -----END PUBLIC KEY-----"""
 
+system_prompt='''your an expert ai engineer and can write ansible playbooks for aws
+return all code in the following format
+<shell_commands>
+commands to install ansible modules (this only includes ansible modules dont install other packages) ansible-galaxy commands
+</shell_commands>
+<inventory_file>
+this contains the inventory file
+</inventory_file>
+<playbook>
+this contains the playbook
+</playbook>
+<playbook_run_command>
+contains the command to run the playbook (use .ini extension for inventory file and .yml extension for playbook file)
+</playbook_run_command>
+
+
+- Include ALL code, even if parts are unchanged
+      - NEVER use placeholders like "// rest of the code remains the same..." or "<- leave original code here ->"
+      - ALWAYS show the complete, up-to-date file contents when updating files
+      - Avoid any form of truncation or summarization
+      - AWS access keys and secrete access keys are in a file called vars.yml use that to authenticate
+      - key file will be in the same directory with name key.pem
+      - playbook file will be in the same directory with name playbook.yml
+      - inventory file will be in the same directory with name inventory_file
+      - dont make any mistakes in the code make sure the syntax is correct and spacing is correct
+      - dont use any undefined variables
+      - variables in vars.yml file include aws_access_key, aws_secret_key, aws_region, everything is default value
+      - mention file extensions in  <playbook_run_command> command
+      - dont create a recursive playbook where for aws_region make sure not to cause circular dependency
+      - use inventory_file.ini as inventory file and mention inventory_file.ini in playbook_command file 
+      - if that module is not installed install it using ansible galaxy in the <shell_commands> section
+      - dont use the wrong module for the wrong task
+      - access_key,secret_key and region are in vars.yml file include it in the playbook
+        - dont use any interactive commands
+        - use this for amis": [
+    {
+      "amazon_linux": "ami-00bb6a80f01f03502",
+      "ubuntu": "ami-00bb6a80f01f03502",
+      "rhel": "ami-02ddb77f8f93ca4ca",
+      "suse": "ami-0da723ce59d9e80ab",
+      "windows_server": "ami-05a00967f06885a63"
+    }
+  ],
+  "vpc_id":"vpc-0b0f2397039aefca8",
+  "subnet_id":"subnet-028fb8a226cdc8c98",
+  "key_name":"latest" for ami ids key name vpc id etc
+   - make contents inside <inventory_file> tag blank if its not needed
+   - dont use  associate_public_ip_address: yes in the playbook
+   - generate correct commands to install the modules which are required by the task
+   - dont use any interactive commands
+   - ansible modules for aws include Community.Aws , amazon.aws · ansible.builtin · ansible.netcommon · ansible.posix · ansible.utils · ansible.windows · arista.eos · awx.awx 
+   - just do what is told and dont add any tests to the playbook
+   - dont use any interactive commands
+   - dont add any extra steps to the playbook
+   - inventory file example
+            [(any_name)]
+            ip_address of the machine
+            [(any_name):vars]
+            ansible_ssh_user=(depends on os)
+            ansible_ssh_private_key_file=key.pem (this remains the same)
+    - default user for ubuntu is ubuntu and for amazon linux is ec2-user
+    - dont use variables if its not defined
+    -  variables defined in vars.yml file are aws_access_key, aws_secret_key, aws_region
+        '''
+
+amazon_context={
+  "amis": [
+    {
+      "amazon_linux": "ami-00bb6a80f01f03502",
+      "ubuntu": "ami-00bb6a80f01f03502",
+      "rhel": "ami-02ddb77f8f93ca4ca",
+      "suse": "ami-0da723ce59d9e80ab",
+      "windows_server": "ami-05a00967f06885a63"
+    }
+  ],
+  "vpc_id":"vpc-0b0f2397039aefca8",
+  "subnet_id":"subnet-028fb8a226cdc8c98",
+  "key_name":"latest"
+}
 lock = 0
 
 queue=[]
@@ -600,9 +681,9 @@ def getAwsKeys(mail:str):
         # Get AWS credentials
         base_url = 'https://us.infisical.com/api/v3/secrets/raw'
         aws_credentials = {
-            'aws_access_key_id': requests.get(f'{base_url}/AWS_ACCESS_KEY?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json(),
-            'aws_secret_access_key': requests.get(f'{base_url}/AWS_SECRET_KEY?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json(),
-            'aws_region': requests.get(f'{base_url}/AWS_REGION?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json()
+            'aws_access_key_id': requests.get(f'{base_url}/AWS_ACCESS_KEY_{mail}?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json(),
+            'aws_secret_access_key': requests.get(f'{base_url}/AWS_SECRET_KEY_{mail}?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json(),
+            'aws_region': requests.get(f'{base_url}/AWS_REGION_{mail}?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json()
             
         }
         #print(aws_credentials)
@@ -802,7 +883,7 @@ def create_incident(create:Dict):
     """
     Create an incident in ServiceNow.
     """
-    model = genai.GenerativeModel("gemini-2.0-flash-exp")
+    model = genai.GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
     res=model.generate_content(f"this is the update I want to do to the incident {create}, this is the sysid and other mappings {sys_id_mapping} generate a body to send to rest api dont do anything else just give the json dont add backticks or json in the result come up with an urgence and impact value based on priority keep the as numbers only fill short_description and description as well")
     body=res.parts[0].text
     match = re.search(r'\{.*\}', body, re.DOTALL)
@@ -851,25 +932,188 @@ def update_incident(incident_number: str, updates: dict):
     response = requests.patch(update_url, json=parsed_json, headers=HEADERS)
     return response.json() if response.status_code == 200 else {"status": "failed", "message": response.text}
 
+@tool
+def get_incident_details(incident_number: str):
+    """
+    Retrieve incident details from ServiceNow using the incident number.
+    """
+    username = "AutoDispacther"
+    password = "manojGM@123"
+    
+    # Construct the URL with query parameter to find the incident by number
+    query_url = f"{SERVICENOW_URL}?sysparm_limit=10&number={incident_number}"
+    
+    # Send GET request to ServiceNow API with basic authentication
+    response = requests.get(
+        query_url, 
+        headers=HEADERS,
+        auth=HTTPBasicAuth(username, password)
+    )
+    
+    # Check if request was successful and results were found
+    if response.status_code == 200 and "result" in response.json() and response.json()['result']:
+        # Return the full incident details
+        return response.json()['result'][0]
+    else:
+        # Return error information if incident not found or request failed
+        return {
+            "status": "failed", 
+            "message": f"Incident not found or error occurred: {response.text}"
+        }
+@tool
+def infra_automation_ai(mesaage:str):
+    '''this function is used to automate the infrastructure related tasks'''
+#     client = OpenAI(
+#     base_url="https://api.sree.shop/v1",
+#     api_key="",
+#     )
+
+#     completion = client.chat.completions.create(
+ 
+   
+#     model="gpt-4o",
+#     messages=[
+#     {
+#       "role": "system",
+#       "content": f"Automate the infrastructure related tasks using the given context {system_prompt} dont do circular dependency the request {mesaage} and the data . For variables use {amazon_context} and add varibles inside the playboof only for aws access key secrete key and region vars.yml is createdreturn the response dont add any extra information"
+#     },{
+#         "role": "user",
+#         "content": f"{mesaage}"
+#     }   
+#   ]
+#     )
+#     infra_ai=completion.choices[0].message.content
+    # model = genai.GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+    # response = model.generate_content(f"Automate the infrastructure related tasks using the given context {system_prompt} and the request {mesaage} and the data for variables {amazon_context}return the response dont add any extra information")
+    # infra_ai= response.parts[0].text
+    sections = {}
+    messages = [
+    (
+        "system",
+        f"Automate the infrastructure related tasks using the given context {system_prompt} dont do circular dependency the request {mesaage} and the data . For variables use {amazon_context} and add varibles inside the playboof only for aws access key secrete key and region vars.yml is createdreturn the response dont add any extra information",
+    ),
+    ("human", f"{mesaage}"),
+]
+    ai_msg = model.invoke(messages)
+    infra_ai= ai_msg.content
+    # Extract shell commands
+    shell_commands_match = re.search(r'<shell_commands>(.*?)</shell_commands>', infra_ai, re.DOTALL)
+    if shell_commands_match:
+        sections['shell_commands'] = shell_commands_match.group(1).strip()
+    
+    # Extract inventory file
+    inventory_match = re.search(r'<inventory_file>(.*?)</inventory_file>', infra_ai, re.DOTALL)
+    if inventory_match:
+        sections['inventory_file'] = inventory_match.group(1).strip()
+    
+    # Extract playbook
+    playbook_match = re.search(r'<playbook>(.*?)</playbook>', infra_ai, re.DOTALL)
+    if playbook_match:
+        sections['playbook'] = playbook_match.group(1).strip()
+    playbook_command_match= re.search(r'<playbook_run_command>(.*?)</playbook_run_command>', infra_ai, re.DOTALL)
+    if playbook_command_match:
+        sections['playbook_command'] = playbook_command_match.group(1).strip()
+    files_created = []
+    getSSHKeys("mgm15072002@gmail.com")
+    subprocess.run("chmod 600 key.pem", shell=True)
+    
+    if 'shell_commands' in sections:
+        with open('install_ansible_modules.sh', 'w') as f:
+            f.write(sections['shell_commands'])
+        os.chmod('install_ansible_modules.sh', 0o755)  # Make the shell script executable
+        files_created.append('install_ansible_modules.sh')
+    
+    if 'inventory_file' in sections:
+        with open('inventory_file.ini', 'w') as f:
+            f.write(sections['inventory_file'])
+        files_created.append('inventory_file.ini')
+    
+    if 'playbook' in sections:
+        with open('playbook.yml', 'w') as f:
+            f.write(sections['playbook'])
+        files_created.append('playbook.yml')
+    if 'playbook_command' in sections:
+        with open('playbook_command.sh', 'w') as f:
+            f.write(sections['playbook_command'])
+            os.chmod('playbook_command.sh', 0o755)
+        files_created.append('playbook_command.sh')
+
+    aws_keys = getAwsKeys("mgm15072002@gmail.com")
+    varfiles = (
+        f"aws_access_key: '{aws_keys['response']['access_key']}'\n"
+        f"aws_secret_key: '{aws_keys['response']['secrete_access']}'\n"
+        f"aws_region: '{aws_keys['response']['region']}'"
+    )
+
+    try:
+        with open("vars.yml", "w") as file:
+            file.write(varfiles)
+    except:
+        print("error creating varfiles")
 
 
-tools = [create_incident, update_incident]
+    
+
+    shell_output = subprocess.run("./install_ansible_modules.sh", shell=True, capture_output=True, text=True)
+    playbook_output=subprocess.run("./playbook_command.sh", shell=True,capture_output=True, text=True)
+    os.remove("install_ansible_modules.sh")
+    os.remove("inventory_file.ini")
+    os.remove("playbook.yml")
+    os.remove("vars.yml")
+    os.remove("key.pem")
+    os.remove("playbook_command.sh")
+    
+    return {"playbook_output": playbook_output.stdout,"playbook_eror": playbook_output.stderr,"shell_output": shell_output.stdout, "shell_error": shell_output.stderr} 
+
+    
+# @tool
+def web_search(message:str):
+    '''this function is used to search the web for the given message to provide context for the infra_ai_automation tool use this with infra_ai_automation tool'''
+    enhanced_message = message+ "search only for ansible modules and commands"
+    client = TavilyClient(os.getenv("tavali_api_key"))
+    response = client.search(
+    query=enhanced_message,
+    max_results=1
+    )
+    return response['results'][0]['content']
+tools = [create_incident, update_incident, get_incident_details,infra_automation_ai]
 llm_with_tools = model.bind_tools(tools)
 
-tool_mapping = {"create_incident": create_incident, "update_incident": update_incident}
+tool_mapping = {"create_incident": create_incident, "update_incident": update_incident,"get_incident_details": get_incident_details,"infra_automation_ai":infra_automation_ai}
 
 @app.post("/chat")
 def chat(message:Mesage):
 
-    gemini = genai.GenerativeModel("gemini-2.0-flash-exp")
-    messages=[HumanMessage(message.content)]
+    gemini = genai.GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+    enhanced_message = message.content
+    messages=[HumanMessage(enhanced_message)]
     res=llm_with_tools.invoke(messages)
     messages.append(res)
     for tool_call in res.tool_calls:
         tool = tool_mapping[tool_call["name"].lower()]
         tool_output = tool.invoke(tool_call["args"])
         messages.append(ToolMessage(tool_output, tool_call_id=tool_call["id"]))
-        ex="successfully created the incident with the description or failed to create incident"
-    result=gemini.generate_content(f"create a success or a failure message like {ex} message for this {messages} and return the incident number as well")
-    llm_with_tools.invoke(messages)
-    return({"result":res.tool_calls,"success/fail":result.parts[0].text})
+        
+    ex2=llm_with_tools.invoke(messages)
+    #ex="successfully created the incident with the description or failed to create incident or created an instance in aws with ip or details"
+    result=gemini.generate_content(f'''generate a response for the given context {ex2} make it short and give only important details related to {message} in sentences dont add unnecessary , or symbols or extra spaces use the {ex2} to provide details and if it failed give details why it failed 
+                                   - dont mention the word playbook and word shell commands and word python error  and dont mention this sentence
+                                   - A warning was generated regarding the Python interpreter path potentially changing in the future. Galaxy collections installation indicated that all requested collections are already installed. No shell errors were reported and 
+                                   - dont mention automation or any such word
+                                   - dont mention The platform is using Python interpreter at /usr/bin/python3.12 and future installations might change this path. 5 tasks were completed and 2 were changed. No tasks failed or were unreachable or any similar sentences
+                                   - dont mention sentences like tasks executed or 5 tasks run etc''')
+    #error=gemini.generate_content(f"if the task is sucessful then return true or else return false {ex2} dont return anything else")
+    # if("false" in error.parts[0].text):
+    #     web_search_res=web_search(result.parts[0].text)
+    #     enhanced_message = message.content + result.parts[0].text + web_search_res
+    #     messages=[HumanMessage(enhanced_message)]
+    #     res=llm_with_tools.invoke(messages)
+    #     messages.append(res)
+    #     for tool_call in res.tool_calls:
+    #         tool = tool_mapping[tool_call["name"].lower()]
+    #         tool_output = tool.invoke(tool_call["args"])
+    #         messages.append(ToolMessage(tool_output, tool_call_id=tool_call["id"]))
+        
+    #     ex2=llm_with_tools.invoke(messages)
+        
+    return({"result":res.tool_calls,"success/fail":result.parts[0].text,"ex2":ex2})

@@ -16,3 +16,5 @@ langchain-google-genai
 langchain[mistralai]
 langchain-community
 langchain-google-vertexai
+openai
+tavily-python
