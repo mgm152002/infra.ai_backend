@@ -2,6 +2,7 @@ fastapi[standard]
 pydantic
 google-generativeai
 requests
+beautifulsoup4
 pinecone
 pinecone
 boto3
