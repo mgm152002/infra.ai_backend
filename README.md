@@ -32,7 +32,9 @@ A fully autonomous **Agentic AI platform** built with **FastAPI** and **LangChai
 
 ## 📷 Demo
 
-> _Coming soon_: Screenshots and terminal demos.
+> _Coming soon_: Screenshots
 
+## RoadMap
+> _Coming soon_
 ---
-This Project is in active Development and more features can be added or removed, we are working on an offfical feature release roadmap 
+This Project is in active Development and more features can be added or removed, we are working on an offfical feature release roadmap some of the features mentioned here are still in development
