@@ -52,7 +52,16 @@ import asyncio
 from sse_starlette.sse import EventSourceResponse
 from typing import AsyncGenerator
 
-app = FastAPI()
+from worker import worker_loop
+
+async def worker_lifespan(app: FastAPI):
+    """Start worker process when application starts"""
+    import threading
+    worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
+    yield
+
+app = FastAPI(lifespan=worker_lifespan)
 security = HTTPBearer()
 from langchain_google_genai import ChatGoogleGenerativeAI
 from openai import OpenAI
@@ -565,7 +574,18 @@ def askQuestion(question: str):
 @app.post("/queueAdd")
 
 def queueAdd(Req:RequestBody):
-    queue.append({"Aws": Req.Aws, "Mail": Req.Mail})
+    sqsqueue = session.resource('sqs').get_queue_by_name(QueueName='infraaiqueue.fifo')
+    message_body = json.dumps({
+        "Aws": Req.Aws.dict(),
+        "Mail": Req.Mail.dict()
+    })
+    content_hash = hashlib.sha256(message_body.encode()).hexdigest()
+    unique_id = f"{content_hash}-{uuid.uuid4().hex}"
+    sqsqueue.send_message(
+        MessageBody=message_body,
+        MessageGroupId='infraai',
+        MessageDeduplicationId=unique_id
+    )
 
 @app.post("/queueRemove")
 def queueRemove():
@@ -1919,8 +1939,10 @@ def incidentAdd(Req:Incident, user_data: dict = Depends(verify_token)):
     # Prepare SQS queue message
     sqsqueue = session.resource('sqs').get_queue_by_name(QueueName='infraaiqueue.fifo')
     message_body = json.dumps({
-        "user_id": user_id
-    })  
+        "user_id": user_id,
+        "inc_number": Req.inc_number,
+        "tag_id": Req.tag_id
+    })
     content_hash = hashlib.sha256(message_body.encode()).hexdigest()
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
     sqsqueue.send_message(MessageBody=message_body, MessageGroupId='infraai', MessageDeduplicationId=unique_id)

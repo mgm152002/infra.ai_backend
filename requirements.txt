@@ -4,7 +4,7 @@ google-generativeai
 requests
 beautifulsoup4
 pinecone
-pinecone
+pinecone-plugins-assistant
 boto3
 langchain
 langchain-core
@@ -14,8 +14,9 @@ redis
 supabase
 python-dotenv
 langchain-google-genai
-langchain[mistralai]
+langchain-mistralai
 langchain-community
 langchain-google-vertexai
 openai
 tavily-python
+sse-starlette
