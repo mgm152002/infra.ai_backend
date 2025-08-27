@@ -55,10 +55,15 @@ from typing import AsyncGenerator
 from worker import worker_loop
 
 async def worker_lifespan(app: FastAPI):
-    """Start worker process when application starts"""
+    """Start multiple worker processes when application starts"""
     import threading
-    worker_thread = threading.Thread(target=worker_loop, daemon=True)
-    worker_thread.start()
+    import os
+    worker_count = int(os.getenv("WORKER_COUNT", "1"))
+    threads = []
+    for i in range(worker_count):
+        thread = threading.Thread(target=worker_loop, daemon=True, name=f"Worker-{i+1}")
+        thread.start()
+        threads.append(thread)
     yield
 
 app = FastAPI(lifespan=worker_lifespan)

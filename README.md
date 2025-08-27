@@ -1,40 +1,51 @@
-# 🔧 Agentic AI for Infrastructure Operations
+# Infra AI Backend
 
-A fully autonomous **Agentic AI platform** built with **FastAPI** and **LangChain** to intelligently manage and resolve infrastructure incidents with minimal human intervention. This system leverages natural language interfaces, real-time context integration, and operational tooling to drastically reduce MTTR (Mean Time to Resolution) and manual workloads.
+## Overview
+This project implements an automated incident resolution system that integrates AWS, Supabase, Google Gemini, and Infisical to provide intelligent infrastructure management.
 
----
+## Architecture
+The system follows a structured workflow:
+1. Polls AWS SQS for incoming incidents
+2. Retrieves system information from Supabase CMDB
+3. Uses Google Gemini for AI-powered diagnostics and resolution planning
+4. Executes resolution steps via SSH
+5. Updates incident status in Supabase
 
-## 🚀 Key Features
+## Key Components
+- **worker.py**: Core implementation of the incident resolution workflow
+- **main.py**: Entry point for local development
+- **.env**: Environment configuration file
+- **requirements.txt**: Python dependencies
 
-- 🤖 **Autonomous Incident Handling**  
-  Reduces MTTR by up to **75%** through intelligent triaging, remediation, and reporting.
+## Security Features
+- Sensitive data redaction in logs
+- Temporary SSH key management with strict permissions
+- Structured error handling with stack trace capture
 
-- 💬 **Natural Language Execution**  
-  Operators can describe tasks like:
-  - “Provision a new Ubuntu server”
-  - “Patch all critical security updates”
-  - “Add a new user to the staging environment”
+## Installation
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-  ...and the AI agent will **execute** them end-to-end.
+# Configure environment
+cp .env.example .env
+# Set appropriate values in .env
+```
 
-- 🌐 **Real-Time Context Awareness**  
-  - Integrates with **web search** and **CMDBs** to gather live environment data.
-  - Improves **incident root cause accuracy by 80%**.
+## Usage
+```bash
+# For local development
+python main.py
 
-- 🧠 **LangChain Agent Architecture**  
-  Custom AI agents designed for infrastructure tasks with built-in memory, tools, and dynamic context-switching.
+# For production worker
+python worker.py
+```
 
-- ⚙️ **FastAPI Backend**  
-  - RESTful interface for chat, command execution, and results tracking.
-  - Easily extensible for Slack, CLI, or web dashboards.
+## Integration Points
+- **AWS**: SQS for message queue, EC2 for instance management
+- **Supabase**: CMDB and incident tracking
+- **Infisical**: Secure SSH key retrieval
+- **Google Gemini**: AI diagnostics and resolution planning
 
----
-
-## 📷 Demo
-
-> _Coming soon_: Screenshots
-
-## RoadMap
-> _Coming soon_
----
-This Project is in active Development and more features can be added or removed, we are working on an offfical feature release roadmap, some of the features mentioned here are still in development.
+## License
+MIT License
