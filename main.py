@@ -55,10 +55,29 @@ from typing import AsyncGenerator
 from worker import worker_loop
 
 async def worker_lifespan(app: FastAPI):
-    """Start worker process when application starts"""
+    """Start multiple worker threads when application starts"""
     import threading
-    worker_thread = threading.Thread(target=worker_loop, daemon=True)
-    worker_thread.start()
+    import os
+    
+    # Safe parsing of WORKER_COUNT with fallback and limits
+    try:
+        worker_count = int(os.getenv("WORKER_COUNT", "1"))
+    except (TypeError, ValueError):
+        worker_count = 1
+    
+    if worker_count < 1:
+        worker_count = 1
+    worker_count = min(worker_count, 64)  # cap to avoid runaway thread creation
+    
+    threads = []
+    for i in range(worker_count):
+        thread = threading.Thread(target=worker_loop, daemon=True, name=f"Worker-{i+1}")
+        thread.start()
+        threads.append(thread)
+    
+    # Store threads in app state for potential graceful shutdown
+    app.state.worker_threads = threads
+    
     yield
 
 app = FastAPI(lifespan=worker_lifespan)
@@ -583,7 +602,7 @@ def queueAdd(Req:RequestBody):
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
     sqsqueue.send_message(
         MessageBody=message_body,
-        MessageGroupId='infraai',
+        MessageGroupId=(Req.Mail.inc_number or "infraai").strip()[:128],  # per-incident with safe fallback
         MessageDeduplicationId=unique_id
     )
 
@@ -1939,12 +1958,28 @@ def incidentAdd(Req:Incident, user_data: dict = Depends(verify_token)):
     # Prepare SQS queue message
     sqsqueue = session.resource('sqs').get_queue_by_name(QueueName='infraaiqueue.fifo')
     message_body = json.dumps({
-        "user_id": user_id,
-        "inc_number": Req.inc_number,
-        "tag_id": Req.tag_id
+        "Aws": {
+            "access_key": "",  # Will be retrieved by worker from user's stored credentials
+            "secrete_access": "",
+            "region": "",
+            "instance_id": Req.tag_id  # Using tag_id as instance_id for now
+        },
+        "Mail": {
+            "inc_number": Req.inc_number,
+            "subject": Req.short_description,
+            "message": f"Incident {Req.inc_number}: {Req.short_description}"
+        },
+        "Meta": {
+            "user_id": user_id,
+            "tag_id": Req.tag_id
+        }
     })
     content_hash = hashlib.sha256(message_body.encode()).hexdigest()
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
-    sqsqueue.send_message(MessageBody=message_body, MessageGroupId='infraai', MessageDeduplicationId=unique_id)
+    sqsqueue.send_message(
+        MessageBody=message_body,
+        MessageGroupId=(Req.inc_number or "infraai").strip()[:128],  # per-incident with safe fallback
+        MessageDeduplicationId=unique_id
+    )
 
     return {"response": {"user_id": user_id}}
