@@ -588,7 +588,7 @@ def queueAdd(Req:RequestBody):
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
     sqsqueue.send_message(
         MessageBody=message_body,
-        MessageGroupId='infraai',
+        MessageGroupId=Req.Mail.inc_number,  # Use per-incident MessageGroupId for concurrent processing
         MessageDeduplicationId=unique_id
     )
 
@@ -1950,6 +1950,10 @@ def incidentAdd(Req:Incident, user_data: dict = Depends(verify_token)):
     })
     content_hash = hashlib.sha256(message_body.encode()).hexdigest()
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
-    sqsqueue.send_message(MessageBody=message_body, MessageGroupId='infraai', MessageDeduplicationId=unique_id)
+    sqsqueue.send_message(
+        MessageBody=message_body,
+        MessageGroupId=Req.inc_number,  # Use per-incident MessageGroupId for concurrent processing
+        MessageDeduplicationId=unique_id
+    )
 
     return {"response": {"user_id": user_id}}
