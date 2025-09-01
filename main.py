@@ -704,8 +704,8 @@ def getAwsKeys(mail:str):
     
     # Proper data format for the authentication request
      auth_data = {
-        "clientSecret": os.getenv('clientSecret'),
-        "clientId": os.getenv('clientId')
+        "clientId": os.getenv('clientId'),
+        "clientSecret": os.getenv('clientSecret')
     }
     
      try:
@@ -730,7 +730,7 @@ def getAwsKeys(mail:str):
         #print(aws_credentials)
      except :
         print("error")
-     awskeys:Aws={"access_key": aws_credentials['aws_access_key_id']['secret']['secretValue'], "secrete_access": aws_credentials['aws_secret_access_key']['secret']['secretValue'], "region": aws_credentials['aws_region']['secret']['secretValue']}
+     awskeys:Aws={"access_key": aws_credentials['aws_access_key_id'][0]['secret']['secretValue'], "secrete_access": aws_credentials['aws_secret_access_key'][0]['secret']['secretValue'], "region": aws_credentials['aws_region'][0]['secret']['secretValue']}
      return{'response':awskeys}
 def getSnowKeys(mail: str):
     secret_auth_uri = "https://app.infisical.com/api/v1/auth/universal-auth/login"
@@ -742,8 +742,8 @@ def getSnowKeys(mail: str):
     
     # Proper data format for the authentication request
     auth_data = {
-        "clientSecret": os.getenv('clientSecret'),
-        "clientId": os.getenv('clientId')
+        "clientId": os.getenv('clientId'),
+        "clientSecret": os.getenv('clientSecret')
     }
     
     try:
@@ -892,7 +892,7 @@ def getAwsKeys(mail:str):
             'aws_region': requests.get(f'{base_url}/AWS_REGION_{mail}?workspaceSlug=infraai-oqb-h&environment=prod', headers=auth_headers).json()
             
         }
-        #print(aws_credentials)
+        print(aws_credentials)
      except :
         print("error")
      awskeys:Aws={"access_key": aws_credentials['aws_access_key_id']['secret']['secretValue'], "secrete_access": aws_credentials['aws_secret_access_key']['secret']['secretValue'], "region": aws_credentials['aws_region']['secret']['secretValue']}
@@ -1018,8 +1018,8 @@ def addAwsCredentials(Aws: Aws,credentials: Annotated[HTTPAuthorizationCredentia
     
     # Proper data format for the authentication request
     auth_data = {
-        "clientSecret": os.getenv('clientSecret'),
-        "clientId": os.getenv('clientId')
+        "clientId": os.getenv('clientId'),
+        "clientSecret": os.getenv('clientSecret')
     }
     try:
          token = credentials.credentials
@@ -1372,8 +1372,11 @@ def infra_automation_ai(mesaage:str,mail:str):
 
     
 
-    shell_output = subprocess.run("./install_ansible_modules.sh", shell=True, capture_output=True, text=True)
-    playbook_output=subprocess.run("./playbook_command.sh", shell=True,capture_output=True, text=True)
+    # shell_output = subprocess.run("./install_ansible_modules.sh", shell=True, capture_output=True, text=True)
+    # playbook_output=subprocess.run("./playbook_command.sh", shell=True,capture_output=True, text=True)
+    playbook_output = subprocess.run(["python3", "ansible_sandbox.py"],capture_output=True,text=True)
+    print(playbook_output.stdout)
+    print(playbook_output.stderr)
     os.remove("install_ansible_modules.sh")
     os.remove("inventory_file.ini")
     os.remove("playbook.yml")
@@ -1381,7 +1384,7 @@ def infra_automation_ai(mesaage:str,mail:str):
     os.remove("key.pem")
     os.remove("playbook_command.sh")
     
-    return {"playbook_output": playbook_output.stdout,"playbook_eror": playbook_output.stderr,"shell_output": shell_output.stdout, "shell_error": shell_output.stderr} 
+    return {"playbook_output": playbook_output.stdout,"playbook_eror": playbook_output.stderr} 
 
 @tool
 def ask_knowledge_base(message:str):
@@ -1722,8 +1725,8 @@ async def update_aws_credentials(Aws: Aws, credentials: Annotated[HTTPAuthorizat
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         auth_data = {
-            "clientSecret": os.getenv('clientSecret'),
-            "clientId": os.getenv('clientId')
+            "clientId": os.getenv('clientId'),
+            "clientSecret": os.getenv('clientSecret')
         }
         
         # Get access token
@@ -1777,8 +1780,8 @@ async def update_ssh_credentials(ssh: ssh, credentials: Annotated[HTTPAuthorizat
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         auth_data = {
-            "clientSecret": os.getenv('clientSecret'),
-            "clientId": os.getenv('clientId')
+            "clientId": os.getenv('clientId'),
+            "clientSecret": os.getenv('clientSecret')
         }
         
         # Get access token
@@ -1824,8 +1827,8 @@ async def update_servicenow_credentials(snow: Snow_key, credentials: Annotated[H
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         auth_data = {
-            "clientSecret": os.getenv('clientSecret'),
-            "clientId": os.getenv('clientId')
+            "clientId": os.getenv('clientId'),
+            "clientSecret": os.getenv('clientSecret')
         }
         
         # Get access token

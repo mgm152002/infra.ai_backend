@@ -224,8 +224,8 @@ def get_ssh_key(mail: str, ctx_logger=None) -> bool:
     secret_auth_uri = "https://app.infisical.com/api/v1/auth/universal-auth/login"
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     auth_data = {
-        "clientSecret": os.getenv('clientSecret'),
-        "clientId": os.getenv('clientId')
+        "clientId": os.getenv('clientId'),
+        "clientSecret": os.getenv('clientSecret')
     }
     try:
         l.debug("Requesting Infisical access token")
