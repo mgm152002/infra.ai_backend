@@ -1280,7 +1280,29 @@ def get_incident_details(incident_number: str,mail:str):
         }
 @tool
 def infra_automation_ai(mesaage:str,mail:str):
-    '''this function is used to automate the infrastructure related tasks'''
+    """
+    Generate and enqueue an AI-generated Ansible job to automate infrastructure tasks.
+    
+    This function sends the provided natural-language request to the configured AI model (via `model.invoke`), parses the model's response for tagged sections (<shell_commands>, <inventory_file>, <playbook>, <playbook_run_command>), writes those sections to local artifact files (install_ansible_modules.sh, inventory_file.ini, playbook.yml, playbook_command.sh) and creates a vars.yml containing AWS credentials obtained for the given user. It uploads any created artifacts (including key.pem) to an S3 prefix and sends a single SQS message pointing to that S3 prefix to schedule remote execution. Local artifacts are removed before returning.
+    
+    Side effects:
+    - May create and delete local files: install_ansible_modules.sh, inventory_file.ini, playbook.yml, playbook_command.sh, vars.yml, key.pem.
+    - Uploads files to the S3 bucket specified by environment variable ANSIBLE_RUNTIME_BUCKET (defaults to "my-ansible-runtime-bucket").
+    - Sends a message to the SQS queue specified by ANSIBLE_JOB_QUEUE_URL.
+    - Calls helpers getSSHKeys(mail) and getAwsKeys(mail) to fetch credentials.
+    
+    Parameters:
+        mesaage (str): Natural-language request describing the desired infrastructure automation.
+        mail (str): User email used to fetch SSH/AWS credentials and to namespace the S3 job prefix.
+    
+    Returns:
+        dict: On success, returns {"queued_job": <job_id>, "s3_prefix": <s3_prefix>}. If the queue URL is not configured, returns {"error": "ANSIBLE_JOB_QUEUE_URL not configured", "job_id": <job_id>}.
+    
+    Notes:
+    - Requires AWS credentials available to boto3 (environment, instance role, or configured profile) to upload to S3 and send SQS messages.
+    - The AI response must include one or more supported tagged sections; missing sections are skipped.
+    - Errors during vars.yml creation are caught silently; other exceptions may propagate.
+    """
 #     client = OpenAI(
 #     base_url="https://api.sree.shop/v1",
 #     api_key="",
@@ -1410,7 +1432,15 @@ def infra_automation_ai(mesaage:str,mail:str):
 
 @tool
 def ask_knowledge_base(message:str):
-    '''this function is used to ask the knowledge base for the given message to provide context '''
+    """
+    Query the knowledge base assistant with a user message and return its reply.
+    
+    Parameters:
+        message (str): User question or prompt to send to the knowledge-base assistant.
+    
+    Returns:
+        dict: {'response': str} — the assistant's answer under the 'response' key.
+    """
     response = askQuestion(message)
     return {'response': response['response']}
 
