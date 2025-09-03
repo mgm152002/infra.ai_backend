@@ -1280,7 +1280,29 @@ def get_incident_details(incident_number: str,mail:str):
         }
 @tool
 def infra_automation_ai(mesaage:str,mail:str):
-    '''this function is used to automate the infrastructure related tasks'''
+    """
+    Generate and enqueue an AI-generated Ansible job to automate infrastructure tasks.
+    
+    This function sends the provided natural-language request to the configured AI model (via `model.invoke`), parses the model's response for tagged sections (<shell_commands>, <inventory_file>, <playbook>, <playbook_run_command>), writes those sections to local artifact files (install_ansible_modules.sh, inventory_file.ini, playbook.yml, playbook_command.sh) and creates a vars.yml containing AWS credentials obtained for the given user. It uploads any created artifacts (including key.pem) to an S3 prefix and sends a single SQS message pointing to that S3 prefix to schedule remote execution. Local artifacts are removed before returning.
+    
+    Side effects:
+    - May create and delete local files: install_ansible_modules.sh, inventory_file.ini, playbook.yml, playbook_command.sh, vars.yml, key.pem.
+    - Uploads files to the S3 bucket specified by environment variable ANSIBLE_RUNTIME_BUCKET (defaults to "my-ansible-runtime-bucket").
+    - Sends a message to the SQS queue specified by ANSIBLE_JOB_QUEUE_URL.
+    - Calls helpers getSSHKeys(mail) and getAwsKeys(mail) to fetch credentials.
+    
+    Parameters:
+        mesaage (str): Natural-language request describing the desired infrastructure automation.
+        mail (str): User email used to fetch SSH/AWS credentials and to namespace the S3 job prefix.
+    
+    Returns:
+        dict: On success, returns {"queued_job": <job_id>, "s3_prefix": <s3_prefix>}. If the queue URL is not configured, returns {"error": "ANSIBLE_JOB_QUEUE_URL not configured", "job_id": <job_id>}.
+    
+    Notes:
+    - Requires AWS credentials available to boto3 (environment, instance role, or configured profile) to upload to S3 and send SQS messages.
+    - The AI response must include one or more supported tagged sections; missing sections are skipped.
+    - Errors during vars.yml creation are caught silently; other exceptions may propagate.
+    """
 #     client = OpenAI(
 #     base_url="https://api.sree.shop/v1",
 #     api_key="",
@@ -1371,24 +1393,54 @@ def infra_automation_ai(mesaage:str,mail:str):
 
 
     
-
-    # shell_output = subprocess.run("./install_ansible_modules.sh", shell=True, capture_output=True, text=True)
-    # playbook_output=subprocess.run("./playbook_command.sh", shell=True,capture_output=True, text=True)
-    playbook_output = subprocess.run(["python3", "ansible_sandbox.py"],capture_output=True,text=True)
-    print(playbook_output.stdout)
-    print(playbook_output.stderr)
-    os.remove("install_ansible_modules.sh")
-    os.remove("inventory_file.ini")
-    os.remove("playbook.yml")
-    os.remove("vars.yml")
-    os.remove("key.pem")
-    os.remove("playbook_command.sh")
     
-    return {"playbook_output": playbook_output.stdout,"playbook_eror": playbook_output.stderr} 
+
+    # Enqueue job for AWS Lambda (container) via SQS and upload artifacts to S3
+    import uuid
+    import json as _json
+    import boto3 as _boto3
+
+    bucket = os.getenv("ANSIBLE_RUNTIME_BUCKET", "my-ansible-runtime-bucket")
+    region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "ap-south-1"))
+    queue_url = os.getenv("ANSIBLE_JOB_QUEUE_URL")
+
+    s3c = _boto3.client("s3", region_name=region)
+    sqsc = _boto3.client("sqs", region_name=region)
+
+    job_id = str(uuid.uuid4())
+    prefix = f"ansible-runtime/{mail}/{job_id}/"
+
+    for f in ["install_ansible_modules.sh","inventory_file.ini","playbook.yml","vars.yml","key.pem","playbook_command.sh"]:
+        if os.path.exists(f):
+            s3c.upload_file(f, bucket, f"{prefix}{f}")
+
+    if not queue_url:
+        # Clean up local files before returning error
+        for f in ["install_ansible_modules.sh","inventory_file.ini","playbook.yml","vars.yml","key.pem","playbook_command.sh"]:
+            if os.path.exists(f):
+                os.remove(f)
+        return {"error": "ANSIBLE_JOB_QUEUE_URL not configured", "job_id": job_id}
+
+    sqsc.send_message(QueueUrl=queue_url, MessageBody=_json.dumps({"s3_prefix": prefix, "mail": mail}))
+
+    # Cleanup local files
+    for f in ["install_ansible_modules.sh","inventory_file.ini","playbook.yml","vars.yml","key.pem","playbook_command.sh"]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    return {"queued_job": job_id, "s3_prefix": prefix}
 
 @tool
 def ask_knowledge_base(message:str):
-    '''this function is used to ask the knowledge base for the given message to provide context '''
+    """
+    Query the knowledge base assistant with a user message and return its reply.
+    
+    Parameters:
+        message (str): User question or prompt to send to the knowledge-base assistant.
+    
+    Returns:
+        dict: {'response': str} — the assistant's answer under the 'response' key.
+    """
     response = askQuestion(message)
     return {'response': response['response']}
 
