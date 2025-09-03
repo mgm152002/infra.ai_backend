@@ -1371,20 +1371,42 @@ def infra_automation_ai(mesaage:str,mail:str):
 
 
     
-
-    # shell_output = subprocess.run("./install_ansible_modules.sh", shell=True, capture_output=True, text=True)
-    # playbook_output=subprocess.run("./playbook_command.sh", shell=True,capture_output=True, text=True)
-    playbook_output = subprocess.run(["python3", "ansible_sandbox.py"],capture_output=True,text=True)
-    print(playbook_output.stdout)
-    print(playbook_output.stderr)
-    os.remove("install_ansible_modules.sh")
-    os.remove("inventory_file.ini")
-    os.remove("playbook.yml")
-    os.remove("vars.yml")
-    os.remove("key.pem")
-    os.remove("playbook_command.sh")
     
-    return {"playbook_output": playbook_output.stdout,"playbook_eror": playbook_output.stderr} 
+
+    # Enqueue job for AWS Lambda (container) via SQS and upload artifacts to S3
+    import uuid
+    import json as _json
+    import boto3 as _boto3
+
+    bucket = os.getenv("ANSIBLE_RUNTIME_BUCKET", "my-ansible-runtime-bucket")
+    region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "ap-south-1"))
+    queue_url = os.getenv("ANSIBLE_JOB_QUEUE_URL")
+
+    s3c = _boto3.client("s3", region_name=region)
+    sqsc = _boto3.client("sqs", region_name=region)
+
+    job_id = str(uuid.uuid4())
+    prefix = f"ansible-runtime/{mail}/{job_id}/"
+
+    for f in ["install_ansible_modules.sh","inventory_file.ini","playbook.yml","vars.yml","key.pem","playbook_command.sh"]:
+        if os.path.exists(f):
+            s3c.upload_file(f, bucket, f"{prefix}{f}")
+
+    if not queue_url:
+        # Clean up local files before returning error
+        for f in ["install_ansible_modules.sh","inventory_file.ini","playbook.yml","vars.yml","key.pem","playbook_command.sh"]:
+            if os.path.exists(f):
+                os.remove(f)
+        return {"error": "ANSIBLE_JOB_QUEUE_URL not configured", "job_id": job_id}
+
+    sqsc.send_message(QueueUrl=queue_url, MessageBody=_json.dumps({"s3_prefix": prefix, "mail": mail}))
+
+    # Cleanup local files
+    for f in ["install_ansible_modules.sh","inventory_file.ini","playbook.yml","vars.yml","key.pem","playbook_command.sh"]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    return {"queued_job": job_id, "s3_prefix": prefix}
 
 @tool
 def ask_knowledge_base(message:str):
