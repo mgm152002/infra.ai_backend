@@ -1,5 +1,5 @@
 from typing import Union, Optional, List
-from fastapi import FastAPI ,File, UploadFile,Depends, Response, status,HTTPException
+from fastapi import FastAPI ,File, UploadFile,Depends, Response, status,HTTPException, Form
 from datetime import datetime
 from fastapi import security
 from pydantic import BaseModel
@@ -20,7 +20,7 @@ from email.mime.multipart import MIMEMultipart
 from langchain.agents import Tool, initialize_agent
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import MessagesPlaceholder
-from langchain.schema import HumanMessage
+from langchain.schema import HumanMessage, SystemMessage
 from langchain_core.messages import ToolMessage
 import smtplib
 from email.mime.text import MIMEText
@@ -40,6 +40,7 @@ import jwt
 import redis
 from supabase import create_client, Client
 from urllib.parse import urlencode
+from urllib.parse import urlparse
 import json
 import hashlib
 from requests.auth import HTTPBasicAuth
@@ -129,6 +130,30 @@ fHY1QOV8mAYKMrqhrpbC4dsGDn9WGta0h003zrHrMauA9mvnGBgIdHMXZiYWjC7M
 mkew+iKms63o1+K6p16OGX3DR+WYnjCWOf6SxsTWOxTCBzxow+m693Afg3stBLR3
 ZQIDAQAB
 -----END PUBLIC KEY-----"""
+
+async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        email = payload.get("email")
+        if email is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials - email not found",
+            )
+        user_response = supabase.table("Users").select("id").eq("email", email).execute()
+        if not user_response.data or len(user_response.data) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        user_id = user_response.data[0]["id"]
+        return {"email": email, "user_id": user_id}
+    except PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials - invalid token",
+        )
 
 system_prompt='''your an expert ai engineer and can write ansible playbooks for aws
 return all code in the following format
@@ -408,9 +433,9 @@ def power_status_tool(Aws: Aws):
         # Decide action based on the status
         action = ""
         if "stopped" in status.lower():
-            action = f"Instance {Aws['']} is stopped. Attempting to start it."
+            action = f"Instance {Aws['instance_id']} is stopped. Attempting to start it."
             try:
-                print(f"--- execute_plan_generator: Attempting plan_item: Action: {plan_item.action}, Desc: {plan_item.description}")
+                print(f"Attempting to start instance {Aws['instance_id']}")
                 ec2.start_instances(InstanceIds=[Aws['instance_id']])
                 action += " Instance has been started successfully."
             except Exception as e:
@@ -579,14 +604,90 @@ def addKnowledge(file: UploadFile = File(...),):
     return{"response": response}
 
 @app.get("/getKnowledge")
-def askQuestion(question: str):
+def askQuestion(question: str, include_runbooks: bool = False, user_data: dict = Depends(verify_token)):
     msg = Message(role='user' ,content=question)
     assistant1 = pc.assistant.Assistant(
     assistant_name="metalaiassistant", 
 
     )
     resp = assistant1.chat(messages=[msg])
-    return {"response": resp['message']['content']}
+    content = resp['message']['content']
+
+    if not include_runbooks:
+        return {"response": content}
+
+    # Fetch relevant runbooks stored by this user
+    try:
+        rb_query = supabase.table("Runbooks")\
+            .select("id,title,tags,description,s3_url,created_at")\
+            .eq("user_id", user_data["user_id"])\
+            .or_(f"title.ilike.%{question}%,tags.ilike.%{question}%,description.ilike.%{question}%")\
+            .order("created_at", desc=True)\
+            .execute()
+        runbooks = rb_query.data or []
+    except Exception as e:
+        runbooks = []
+        content = f"{content}\n\n(Note: failed to fetch runbooks: {str(e)})"
+
+    return {"response": content, "runbooks": runbooks}
+
+@app.post("/runbooks", response_model=dict)
+async def upload_runbook(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    tags: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    user_data: dict = Depends(verify_token)
+):
+    try:
+        bucket = os.getenv("RUNBOOKS_BUCKET", "infraai-runbooks")
+        region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "ap-south-1"))
+        s3c = session.client("s3")
+
+        base, ext = os.path.splitext(file.filename or "runbook")
+        safe_base = re.sub(r"[^A-Za-z0-9._-]", "_", base) or "runbook"
+        key = f"runbooks/{user_data['user_id']}/{uuid.uuid4().hex}_{safe_base}{ext}"
+
+        s3c.upload_fileobj(
+            file.file,
+            bucket,
+            key,
+            ExtraArgs={"ContentType": file.content_type or "application/octet-stream"}
+        )
+
+        s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+
+        record = {
+            "title": title,
+            "tags": tags,
+            "description": description,
+            "s3_url": s3_url,
+            "user_id": user_data["user_id"],
+            "created_at": datetime.utcnow().isoformat()
+        }
+        db_res = supabase.table("Runbooks").insert(record).execute()
+        return {"response": {"s3_url": s3_url, "record": db_res.data}}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Runbook upload failed: {str(e)}"
+        )
+
+@app.get("/runbooks", response_model=dict)
+async def list_runbooks(query: Optional[str] = None, user_data: dict = Depends(verify_token)):
+    try:
+        q = supabase.table("Runbooks")\
+            .select("id,title,tags,description,s3_url,created_at")\
+            .eq("user_id", user_data["user_id"])  
+        if query:
+            q = q.or_(f"title.ilike.%{query}%,tags.ilike.%{query}%,description.ilike.%{query}%")
+        res = q.order("created_at", desc=True).execute()
+        return {"response": res.data}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list runbooks: {str(e)}"
+        )
 
 
 
@@ -1312,8 +1413,27 @@ def infra_automation_ai(mesaage:str,mail:str):
     ),
     ("human", f"{mesaage}"),
 ]
-    ai_msg = model.invoke(messages)
-    infra_ai= ai_msg.content
+    # First consult runbooks for the user's org/account
+    try:
+        rb = find_runbooks.invoke({"query": mesaage[:80], "mail": mail, "include_content": True, "limit": 1})
+    except Exception:
+        rb = {"runbooks": []}
+
+    if rb and isinstance(rb, dict) and rb.get("runbooks"):
+        rb0 = rb["runbooks"][0]
+        rb_content = rb0.get("content_preview") or rb0.get("description") or ""
+        messages = [
+            (
+                "system",
+                f"Follow the given runbook strictly. Use vars.yml for AWS keys only. Context variables: {amazon_context}. Runbook:\n{rb_content}"
+            ),
+            ("human", f"{mesaage}")
+        ]
+        ai_msg = model.invoke(messages)
+        infra_ai = ai_msg.content
+    else:
+        ai_msg = model.invoke(messages)
+        infra_ai= ai_msg.content
     # Extract shell commands
     shell_commands_match = re.search(r'<shell_commands>(.*?)</shell_commands>', infra_ai, re.DOTALL)
     if shell_commands_match:
@@ -1392,6 +1512,59 @@ def ask_knowledge_base(message:str):
     response = askQuestion(message)
     return {'response': response['response']}
 
+@tool
+def find_runbooks(query: str = "", mail: str = "", include_content: bool = False, limit: int = 3):
+    '''Search user's runbooks by title/tags/description and optionally include text preview content.'''
+    try:
+        # resolve user_id from mail
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"runbooks": [], "error": "user not found"}
+        user_id = user_response.data[0]["id"]
+
+        # query runbooks
+        q = supabase.table("Runbooks").select("id,title,tags,description,s3_url,created_at").eq("user_id", user_id)
+        if query:
+            q = q.or_(f"title.ilike.%{query}%,tags.ilike.%{query}%,description.ilike.%{query}%")
+        q = q.order("created_at", desc=True)
+        if hasattr(q, 'limit'):
+            q = q.limit(limit)
+        res = q.execute()
+        items = res.data or []
+
+        if include_content and items:
+            s3c = session.client("s3")
+            enriched = []
+            for it in items:
+                s3_url = it.get("s3_url") or ""
+                content_preview = None
+                try:
+                    if s3_url:
+                        parsed = urlparse(s3_url)
+                        host = parsed.netloc  # e.g., bucket.s3.region.amazonaws.com
+                        path = parsed.path.lstrip('/')
+                        bucket = host.split('.')[0]
+                        key = path
+                        head = s3c.head_object(Bucket=bucket, Key=key)
+                        ctype = head.get('ContentType', '')
+                        # only try preview for text-like files
+                        text_like = ctype.startswith('text/') or any(key.lower().endswith(ext) for ext in ['.md', '.txt', '.json', '.yaml', '.yml'])
+                        if text_like:
+                            obj = s3c.get_object(Bucket=bucket, Key=key)
+                            raw = obj['Body'].read(4096)
+                            try:
+                                content_preview = raw.decode('utf-8', errors='ignore')
+                            except Exception:
+                                content_preview = None
+                except Exception:
+                    content_preview = None
+                enriched.append({**it, "content_preview": content_preview})
+            items = enriched
+
+        return {"runbooks": items}
+    except Exception as e:
+        return {"runbooks": [], "error": str(e)}
+
 @app.post("/websearch")
 async def web_search(message: str, user_data: dict = Depends(verify_token)):
     '''this function is used to search the web for the given message'''
@@ -1453,10 +1626,10 @@ async def web_search(message: str, user_data: dict = Depends(verify_token)):
             "response": f"Unable to retrieve web search results. Error: {str(e)}. Please try a different query or check your internet connection."
         }
 
-tools = [create_incident, update_incident, get_incident_details,infra_automation_ai]
+tools = [create_incident, update_incident, get_incident_details,infra_automation_ai, find_runbooks, ask_knowledge_base]
 llm_with_tools = model.bind_tools(tools)
 
-tool_mapping = {"create_incident": create_incident, "update_incident": update_incident,"get_incident_details": get_incident_details,"infra_automation_ai": infra_automation_ai}
+tool_mapping = {"create_incident": create_incident, "update_incident": update_incident, "get_incident_details": get_incident_details, "infra_automation_ai": infra_automation_ai, "find_runbooks": find_runbooks, "ask_knowledge_base": ask_knowledge_base}
 
 @app.post("/chat")
 def chat(message:Mesage,credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],response: Response):
@@ -1469,8 +1642,15 @@ def chat(message:Mesage,credentials: Annotated[HTTPAuthorizationCredentials, Dep
         return({"error":e})
 
     gemini = genai.GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
-    enhanced_message = message.content+mail
-    messages=[HumanMessage(enhanced_message)]
+    policy = (
+        "You are an automation agent. Before executing or generating any action plan, always:"
+        " 1) Call the 'find_runbooks' tool with a focused query derived from the user's request and the user's email provided below."
+        " 2) If a relevant runbook is found, follow it strictly for steps and commands."
+        " 3) Only if no suitable runbook exists, proceed with your own plan or other tools."
+        f" user_email: {mail}"
+    )
+    enhanced_message = message.content
+    messages=[SystemMessage(policy), HumanMessage(enhanced_message)]
     res=llm_with_tools.invoke(messages)
     messages.append(res)
     for tool_call in res.tool_calls:
