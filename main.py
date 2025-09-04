@@ -1,6 +1,6 @@
 from typing import Union, Optional, List
 from fastapi import FastAPI ,File, UploadFile,Depends, Response, status,HTTPException, Form
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import security
 from pydantic import BaseModel
 from pydantic.networks import IPvAnyAddress
@@ -132,9 +132,27 @@ ZQIDAQAB
 -----END PUBLIC KEY-----"""
 
 async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
+    # Optional dev bypass for local testing only
+    if os.getenv("DEV_SKIP_AUTH", "").lower() == "true":
+        return {"email": "dev@example.com", "user_id": 0}
+
     try:
         token = credentials.credentials
-        payload = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        aud = os.getenv("CLERK_JWT_AUD")
+        iss = os.getenv("CLERK_JWT_ISS")
+
+        decode_kwargs = {
+            "key": clerk_public_key,
+            "algorithms": ["RS256"],
+            "options": {"require": ["exp", "iat", "sub"]},
+        }
+        if aud:
+            decode_kwargs["audience"] = aud
+        if iss:
+            decode_kwargs["issuer"] = iss
+
+        payload = jwt.decode(token, **decode_kwargs)
+
         email = payload.get("email")
         if email is None:
             raise HTTPException(
@@ -149,6 +167,11 @@ async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depe
             )
         user_id = user_response.data[0]["id"]
         return {"email": email, "user_id": user_id}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired",
+        )
     except PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -369,11 +392,14 @@ def power_status_tool(Aws: Aws):
     # Initialize the Gemini model
     model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
+    # Normalize Aws to a dict to support both Pydantic model and dict inputs
+    aws_obj = Aws.dict() if hasattr(Aws, "dict") else Aws
+
     # Generate AWS credentials file
     varfiles = (
-        f"aws_access_key_id: '{Aws['access_key']}'\n"
-        f"aws_secret_access_key: '{Aws['secrete_access']}'\n"
-        f"aws_region: '{Aws['region']}'"
+        f"aws_access_key_id: '{aws_obj['access_key']}'\n"
+        f"aws_secret_access_key: '{aws_obj['secrete_access']}'\n"
+        f"aws_region: '{aws_obj['region']}'"
     )
 
     try:
@@ -402,7 +428,7 @@ def power_status_tool(Aws: Aws):
 
         # Use the Gemini model to process the instance status
         query = (
-            f"From the given {aws_assets}, find the status and OS information of the instance with ID {Aws['instance_id']}. "
+            f"From the given {aws_assets}, find the status and OS information of the instance with ID {aws_obj['instance_id']}. "
             "Just return the status  and  and not anything else."
         )
         response = model.generate_content(query)
@@ -413,7 +439,7 @@ def power_status_tool(Aws: Aws):
         )
         
         query2 = (
-            f"From the given {aws_assets}, find the status and OS information of the instance with ID {Aws['instance_id']}. "
+            f"From the given {aws_assets}, find the status and OS information of the instance with ID {aws_obj['instance_id']}. "
             "Just return the os and flavour of os like amazon linux or rhel form the  etc  and  and not anything else."
         )
         response2 = model.generate_content(query2)
@@ -425,33 +451,36 @@ def power_status_tool(Aws: Aws):
         # Initialize boto3 client
         ec2 = boto3.client(
             "ec2",
-            aws_access_key_id=Aws["access_key"],
-            aws_secret_access_key=Aws["secrete_access"],
-            region_name=Aws["region"],
+            aws_access_key_id=aws_obj["access_key"],
+            aws_secret_access_key=aws_obj["secrete_access"],
+            region_name=aws_obj["region"],
         )
 
         # Decide action based on the status
         action = ""
         if "stopped" in status.lower():
-            action = f"Instance {Aws['instance_id']} is stopped. Attempting to start it."
+            aws_instance_id = aws_obj["instance_id"]
+            action = f"Instance {aws_instance_id} is stopped. Attempting to start it."
             try:
-                print(f"Attempting to start instance {Aws['instance_id']}")
-                ec2.start_instances(InstanceIds=[Aws['instance_id']])
+                print(f"Attempting to start instance {aws_instance_id}")
+                ec2.start_instances(InstanceIds=[aws_instance_id])
                 action += " Instance has been started successfully."
             except Exception as e:
                 action += f" Failed to start instance. Error: {str(e)}"
                 send_escalation_email(
                     subject="AWS Instance Start Failure",
-                    message=f"Failed to start instance {Aws['instance_id']}. Error: {str(e)}",
+                    message=f"Failed to start instance {aws_instance_id}. Error: {str(e)}",
                     recipient="mgm15072002@gmail.com",
                 )
         elif "running" in status.lower():
-            action = f"Instance {Aws['instance_id']} Instance has been started successfully."
+            aws_instance_id = aws_obj["instance_id"]
+            action = f"Instance {aws_instance_id} Instance has been started successfully."
         else:
-            action = f"Instance {Aws['instance_id']} status is unknown. Escalating to L2 engineer."
+            aws_instance_id = aws_obj["instance_id"]
+            action = f"Instance {aws_instance_id} status is unknown. Escalating to L2 engineer."
             send_escalation_email(
                 subject="AWS Instance Status Unknown",
-                message=f"The status of instance {Aws['instance_id']} could not be determined.",
+                message=f"The status of instance {aws_instance_id} could not be determined.",
                 recipient="swiftgmr@gmail.com",
             )
 
@@ -648,11 +677,16 @@ async def upload_runbook(
         safe_base = re.sub(r"[^A-Za-z0-9._-]", "_", base) or "runbook"
         key = f"runbooks/{user_data['user_id']}/{uuid.uuid4().hex}_{safe_base}{ext}"
 
+        extra = {
+            "ContentType": file.content_type or "application/octet-stream",
+            "ACL": "private",
+            "ServerSideEncryption": "AES256",
+        }
         s3c.upload_fileobj(
             file.file,
             bucket,
             key,
-            ExtraArgs={"ContentType": file.content_type or "application/octet-stream"}
+            ExtraArgs=extra,
         )
 
         s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
@@ -663,7 +697,7 @@ async def upload_runbook(
             "description": description,
             "s3_url": s3_url,
             "user_id": user_data["user_id"],
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
         db_res = supabase.table("Runbooks").insert(record).execute()
         return {"response": {"s3_url": s3_url, "record": db_res.data}}
@@ -1172,30 +1206,7 @@ def addAwsCredentials(Aws: Aws,credentials: Annotated[HTTPAuthorizationCredentia
     
     
     #json_payload = json.dumps(payload)
-async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
-        email = payload.get("email")
-        if email is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials - email not found",
-            )
-        user_response = supabase.table("Users").select("id").eq("email", email).execute()
-        if not user_response.data or len(user_response.data) == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        user_id = user_response.data[0]["id"]
-        return {"email": email, "user_id": user_id}
-    except PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials - invalid token",
-        )
+# DUPLICATE REMOVED: consolidated into the hardened verify_token above
     
 @app.get("/allIncidents")
 
@@ -1541,17 +1552,20 @@ def find_runbooks(query: str = "", mail: str = "", include_content: bool = False
                 try:
                     if s3_url:
                         parsed = urlparse(s3_url)
-                        host = parsed.netloc  # e.g., bucket.s3.region.amazonaws.com
                         path = parsed.path.lstrip('/')
+                        host = parsed.netloc
+                        expected_bucket = os.getenv("RUNBOOKS_BUCKET", "infraai-runbooks")
                         bucket = host.split('.')[0]
+                        if bucket != expected_bucket:
+                            raise ValueError("unexpected bucket")
                         key = path
-                        head = s3c.head_object(Bucket=bucket, Key=key)
-                        ctype = head.get('ContentType', '')
-                        # only try preview for text-like files
+                        # fetch first 4KB; get ContentType from response; ensure stream is closed
+                        obj = s3c.get_object(Bucket=bucket, Key=key, Range="bytes=0-4095")
+                        ctype = obj.get('ContentType', '')
                         text_like = ctype.startswith('text/') or any(key.lower().endswith(ext) for ext in ['.md', '.txt', '.json', '.yaml', '.yml'])
                         if text_like:
-                            obj = s3c.get_object(Bucket=bucket, Key=key)
-                            raw = obj['Body'].read(4096)
+                            raw = obj['Body'].read()
+                            obj['Body'].close()
                             try:
                                 content_preview = raw.decode('utf-8', errors='ignore')
                             except Exception:
