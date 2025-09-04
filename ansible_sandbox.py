@@ -6,9 +6,17 @@ import time
 # AWS CONFIG (Root credentials)
 # -------------------------------
 AWS_ACCESS_KEY = os.getenv("access_key")       # export access_key=...
-AWS_SECRET_KEY = os.getenv("secrete_access")    # export secret_access=...
+AWS_SECRET_KEY = os.getenv("secret_access")    # export secret_access=...
 REGION = "ap-south-1"
-ACCOUNT_ID = "os.gentenv("account_id")
+ACCOUNT_ID = os.getenv("account_id")
+if not ACCOUNT_ID:
+    sts = boto3.client(
+        "sts",
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=REGION,
+    )
+    ACCOUNT_ID = sts.get_caller_identity()["Account"]
 
 BUCKET = "my-ansible-runtime-bucket"  # must exist already
 CLUSTER_NAME = "ansible-runner-cluster"
@@ -75,13 +83,13 @@ ecs.register_task_definition(
             "name": CONTAINER_NAME,
             "image": ECR_IMAGE,
             "entryPoint": ["/bin/sh", "-c"],
-           "command": [
-  "aws s3 cp s3://{}/ansible-runtime/ . --recursive && "
-  "chmod +x install_ansible_modules.sh playbook_command.sh && "
-  "./install_ansible_modules.sh && "
-  "./playbook_command.sh && "
-  "rm -f *".format(BUCKET)
-],
+            "command": [
+                f"aws s3 cp s3://{BUCKET}/ansible-runtime/ . --recursive && "
+                "chmod +x install_ansible_modules.sh playbook_command.sh && "
+                "./install_ansible_modules.sh && "
+                "./playbook_command.sh && "
+                "rm -f *"
+            ],
             "environment": [
                 {"name": "AWS_ACCESS_KEY_ID", "value": AWS_ACCESS_KEY},
                 {"name": "AWS_SECRET_ACCESS_KEY", "value": AWS_SECRET_KEY},
