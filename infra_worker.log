@@ -515,3 +515,703 @@
 2025-09-01 19:35:35,409 DEBUG No messages received; continuing
 2025-09-01 19:35:55,690 DEBUG No messages received; continuing
 2025-09-01 19:36:15,989 DEBUG No messages received; continuing
+2025-09-27 17:46:21,702 INFO Worker started - monitoring incident queue
+2025-09-27 17:46:42,162 DEBUG No messages received; continuing
+2025-09-27 17:47:02,423 DEBUG No messages received; continuing
+2025-09-27 17:47:22,708 DEBUG No messages received; continuing
+2025-09-27 17:47:43,047 DEBUG No messages received; continuing
+2025-09-27 17:47:59,515 INFO Worker started - monitoring incident queue
+2025-09-27 17:48:19,971 DEBUG No messages received; continuing
+2025-09-27 17:48:40,205 DEBUG No messages received; continuing
+2025-09-27 17:49:00,451 DEBUG No messages received; continuing
+2025-09-27 17:49:20,772 DEBUG No messages received; continuing
+2025-09-27 17:49:41,154 DEBUG No messages received; continuing
+2025-09-27 17:50:01,432 DEBUG No messages received; continuing
+2025-09-27 17:50:21,732 DEBUG No messages received; continuing
+2025-09-27 17:50:44,447 INFO Worker started - monitoring incident queue
+2025-09-27 17:51:04,915 DEBUG No messages received; continuing
+2025-09-27 17:51:25,199 DEBUG No messages received; continuing
+2025-09-27 17:51:45,472 DEBUG No messages received; continuing
+2025-09-27 17:52:05,852 DEBUG No messages received; continuing
+2025-09-27 17:52:26,113 DEBUG No messages received; continuing
+2025-09-27 17:52:48,887 INFO Worker started - monitoring incident queue
+2025-09-27 17:53:09,638 DEBUG No messages received; continuing
+2025-09-27 17:53:29,921 DEBUG No messages received; continuing
+2025-09-27 17:53:50,195 DEBUG No messages received; continuing
+2025-09-27 17:54:10,479 DEBUG No messages received; continuing
+2025-09-27 17:54:30,848 DEBUG No messages received; continuing
+2025-09-27 17:54:51,130 DEBUG No messages received; continuing
+2025-09-27 17:54:59,714 INFO Worker started - monitoring incident queue
+2025-09-27 17:55:20,179 DEBUG No messages received; continuing
+2025-09-27 17:55:40,429 DEBUG No messages received; continuing
+2025-09-27 17:56:00,674 DEBUG No messages received; continuing
+2025-09-27 17:56:22,890 INFO Worker started - monitoring incident queue
+2025-09-27 17:56:43,318 DEBUG No messages received; continuing
+2025-09-27 17:57:03,572 DEBUG No messages received; continuing
+2025-09-27 17:57:23,831 DEBUG No messages received; continuing
+2025-09-27 17:57:44,087 DEBUG No messages received; continuing
+2025-09-27 17:58:04,354 DEBUG No messages received; continuing
+2025-09-27 17:58:24,650 DEBUG No messages received; continuing
+2025-09-27 17:58:44,962 DEBUG No messages received; continuing
+2025-09-27 17:59:05,247 DEBUG No messages received; continuing
+2025-09-27 17:59:25,568 DEBUG No messages received; continuing
+2025-09-27 17:59:45,939 DEBUG No messages received; continuing
+2025-09-27 18:00:06,210 DEBUG No messages received; continuing
+2025-09-27 18:00:26,510 DEBUG No messages received; continuing
+2025-09-27 18:00:46,759 DEBUG No messages received; continuing
+2025-09-27 18:01:07,007 DEBUG No messages received; continuing
+2025-09-27 18:01:27,315 DEBUG No messages received; continuing
+2025-09-27 18:01:47,592 DEBUG No messages received; continuing
+2025-09-27 18:02:07,870 DEBUG No messages received; continuing
+2025-09-27 18:02:28,145 DEBUG No messages received; continuing
+2025-09-27 18:02:48,524 DEBUG No messages received; continuing
+2025-09-27 18:03:08,794 DEBUG No messages received; continuing
+2025-09-27 18:03:29,070 DEBUG No messages received; continuing
+2025-09-27 18:03:49,454 DEBUG No messages received; continuing
+2025-09-27 18:04:09,730 DEBUG No messages received; continuing
+2025-09-27 18:04:30,103 DEBUG No messages received; continuing
+2025-09-27 18:04:50,423 DEBUG No messages received; continuing
+2025-09-27 18:05:10,660 DEBUG No messages received; continuing
+2025-09-27 18:05:30,948 DEBUG No messages received; continuing
+2025-09-27 18:05:51,317 DEBUG No messages received; continuing
+2025-09-27 18:06:11,576 DEBUG No messages received; continuing
+2025-09-27 18:06:31,852 DEBUG No messages received; continuing
+2025-09-27 18:06:52,175 DEBUG No messages received; continuing
+2025-09-27 18:07:12,518 DEBUG No messages received; continuing
+2025-09-27 18:07:32,785 DEBUG No messages received; continuing
+2025-09-27 19:38:59,614 DEBUG No messages received; continuing
+2025-09-27 21:11:36,789 ERROR Worker loop unexpected error: Could not connect to the endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connection.py", line 174, in _new_conn
+    conn = connection.create_connection(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/connection.py", line 72, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 953, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 464, in send
+    urllib_response = conn.urlopen(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 527, in increment
+    raise six.reraise(type(error), error, _stacktrace)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/packages/six.py", line 770, in reraise
+    raise value
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 404, in _make_request
+    self._validate_conn(conn)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 1061, in _validate_conn
+    conn.connect()
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connection.py", line 363, in connect
+    self.sock = conn = self._new_conn()
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connection.py", line 186, in _new_conn
+    raise NewConnectionError(
+urllib3.exceptions.NewConnectionError: <botocore.awsrequest.AWSHTTPSConnection object at 0x1178043a0>: Failed to establish a new connection: [Errno 8] nodename nor servname provided, or not known
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend copy/worker.py", line 509, in worker_loop
+    messages = queue.receive_messages(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/factory.py", line 581, in do_action
+    response = action(self, *args, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/action.py", line 88, in __call__
+    response = getattr(parent.meta.client, operation_name)(*args, **params)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 569, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1005, in _make_api_call
+    http, parsed_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1029, in _make_request
+    return self._endpoint.make_request(operation_model, request_dict)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 119, in make_request
+    return self._send_request(request_dict, operation_model)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 200, in _send_request
+    while self._needs_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 360, in _needs_retry
+    responses = self._event_emitter.emit(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 412, in emit
+    return self._emitter.emit(aliased_event_name, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 256, in emit
+    return self._emit(event_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 239, in _emit
+    response = handler(**kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 207, in __call__
+    if self._checker(**checker_kwargs):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 284, in __call__
+    should_retry = self._should_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 320, in _should_retry
+    return self._checker(attempt_number, response, caught_exception)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 363, in __call__
+    checker_response = checker(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 247, in __call__
+    return self._check_caught_exception(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 416, in _check_caught_exception
+    raise caught_exception
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 279, in _do_get_response
+    http_response = self._send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 383, in _send
+    return self.http_session.send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 493, in send
+    raise EndpointConnectionError(endpoint_url=request.url, error=e)
+botocore.exceptions.EndpointConnectionError: Could not connect to the endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+2025-09-27 22:32:05,620 DEBUG No messages received; continuing
+2025-09-28 04:31:11,540 ERROR Worker loop unexpected error: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 468, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 463, in _make_request
+    httplib_response = conn.getresponse()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 1349, in getresponse
+    response.begin()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 316, in begin
+    version, status, reason = self._read_status()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 277, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 704, in readinto
+    return self._sock.recv_into(b)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1241, in recv_into
+    return self.read(nbytes, buffer)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1099, in read
+    return self._sslobj.read(len, buffer)
+socket.timeout: The read operation timed out
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 464, in send
+    urllib_response = conn.urlopen(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 527, in increment
+    raise six.reraise(type(error), error, _stacktrace)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/packages/six.py", line 770, in reraise
+    raise value
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 470, in _make_request
+    self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 358, in _raise_timeout
+    raise ReadTimeoutError(
+urllib3.exceptions.ReadTimeoutError: AWSHTTPSConnectionPool(host='sqs.ap-south-1.amazonaws.com', port=443): Read timed out. (read timeout=60)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend copy/worker.py", line 509, in worker_loop
+    messages = queue.receive_messages(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/factory.py", line 581, in do_action
+    response = action(self, *args, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/action.py", line 88, in __call__
+    response = getattr(parent.meta.client, operation_name)(*args, **params)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 569, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1005, in _make_api_call
+    http, parsed_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1029, in _make_request
+    return self._endpoint.make_request(operation_model, request_dict)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 119, in make_request
+    return self._send_request(request_dict, operation_model)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 200, in _send_request
+    while self._needs_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 360, in _needs_retry
+    responses = self._event_emitter.emit(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 412, in emit
+    return self._emitter.emit(aliased_event_name, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 256, in emit
+    return self._emit(event_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 239, in _emit
+    response = handler(**kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 207, in __call__
+    if self._checker(**checker_kwargs):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 284, in __call__
+    should_retry = self._should_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 320, in _should_retry
+    return self._checker(attempt_number, response, caught_exception)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 363, in __call__
+    checker_response = checker(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 247, in __call__
+    return self._check_caught_exception(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 416, in _check_caught_exception
+    raise caught_exception
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 279, in _do_get_response
+    http_response = self._send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 383, in _send
+    return self.http_session.send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 501, in send
+    raise ReadTimeoutError(endpoint_url=request.url, error=e)
+botocore.exceptions.ReadTimeoutError: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+2025-09-28 10:27:41,696 ERROR Worker loop unexpected error: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 468, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 463, in _make_request
+    httplib_response = conn.getresponse()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 1349, in getresponse
+    response.begin()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 316, in begin
+    version, status, reason = self._read_status()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 277, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 704, in readinto
+    return self._sock.recv_into(b)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1241, in recv_into
+    return self.read(nbytes, buffer)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1099, in read
+    return self._sslobj.read(len, buffer)
+socket.timeout: The read operation timed out
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 464, in send
+    urllib_response = conn.urlopen(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 527, in increment
+    raise six.reraise(type(error), error, _stacktrace)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/packages/six.py", line 770, in reraise
+    raise value
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 470, in _make_request
+    self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 358, in _raise_timeout
+    raise ReadTimeoutError(
+urllib3.exceptions.ReadTimeoutError: AWSHTTPSConnectionPool(host='sqs.ap-south-1.amazonaws.com', port=443): Read timed out. (read timeout=60)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend copy/worker.py", line 509, in worker_loop
+    messages = queue.receive_messages(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/factory.py", line 581, in do_action
+    response = action(self, *args, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/action.py", line 88, in __call__
+    response = getattr(parent.meta.client, operation_name)(*args, **params)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 569, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1005, in _make_api_call
+    http, parsed_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1029, in _make_request
+    return self._endpoint.make_request(operation_model, request_dict)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 119, in make_request
+    return self._send_request(request_dict, operation_model)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 200, in _send_request
+    while self._needs_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 360, in _needs_retry
+    responses = self._event_emitter.emit(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 412, in emit
+    return self._emitter.emit(aliased_event_name, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 256, in emit
+    return self._emit(event_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 239, in _emit
+    response = handler(**kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 207, in __call__
+    if self._checker(**checker_kwargs):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 284, in __call__
+    should_retry = self._should_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 320, in _should_retry
+    return self._checker(attempt_number, response, caught_exception)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 363, in __call__
+    checker_response = checker(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 247, in __call__
+    return self._check_caught_exception(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 416, in _check_caught_exception
+    raise caught_exception
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 279, in _do_get_response
+    http_response = self._send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 383, in _send
+    return self.http_session.send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 501, in send
+    raise ReadTimeoutError(endpoint_url=request.url, error=e)
+botocore.exceptions.ReadTimeoutError: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+2025-09-28 12:15:51,120 DEBUG No messages received; continuing
+2025-09-28 13:35:13,116 DEBUG No messages received; continuing
+2025-09-28 14:16:40,451 DEBUG No messages received; continuing
+2025-09-28 15:02:32,311 DEBUG No messages received; continuing
+2025-09-28 18:37:59,429 ERROR Worker loop unexpected error: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 468, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 463, in _make_request
+    httplib_response = conn.getresponse()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 1349, in getresponse
+    response.begin()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 316, in begin
+    version, status, reason = self._read_status()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 277, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 704, in readinto
+    return self._sock.recv_into(b)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1241, in recv_into
+    return self.read(nbytes, buffer)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1099, in read
+    return self._sslobj.read(len, buffer)
+socket.timeout: The read operation timed out
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 464, in send
+    urllib_response = conn.urlopen(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 527, in increment
+    raise six.reraise(type(error), error, _stacktrace)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/packages/six.py", line 770, in reraise
+    raise value
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 470, in _make_request
+    self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 358, in _raise_timeout
+    raise ReadTimeoutError(
+urllib3.exceptions.ReadTimeoutError: AWSHTTPSConnectionPool(host='sqs.ap-south-1.amazonaws.com', port=443): Read timed out. (read timeout=60)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend copy/worker.py", line 509, in worker_loop
+    messages = queue.receive_messages(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/factory.py", line 581, in do_action
+    response = action(self, *args, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/action.py", line 88, in __call__
+    response = getattr(parent.meta.client, operation_name)(*args, **params)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 569, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1005, in _make_api_call
+    http, parsed_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1029, in _make_request
+    return self._endpoint.make_request(operation_model, request_dict)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 119, in make_request
+    return self._send_request(request_dict, operation_model)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 200, in _send_request
+    while self._needs_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 360, in _needs_retry
+    responses = self._event_emitter.emit(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 412, in emit
+    return self._emitter.emit(aliased_event_name, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 256, in emit
+    return self._emit(event_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 239, in _emit
+    response = handler(**kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 207, in __call__
+    if self._checker(**checker_kwargs):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 284, in __call__
+    should_retry = self._should_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 320, in _should_retry
+    return self._checker(attempt_number, response, caught_exception)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 363, in __call__
+    checker_response = checker(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 247, in __call__
+    return self._check_caught_exception(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 416, in _check_caught_exception
+    raise caught_exception
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 279, in _do_get_response
+    http_response = self._send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 383, in _send
+    return self.http_session.send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 501, in send
+    raise ReadTimeoutError(endpoint_url=request.url, error=e)
+botocore.exceptions.ReadTimeoutError: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+2025-09-29 01:58:16,907 ERROR Worker loop unexpected error: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 468, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 463, in _make_request
+    httplib_response = conn.getresponse()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 1349, in getresponse
+    response.begin()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 316, in begin
+    version, status, reason = self._read_status()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 277, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 704, in readinto
+    return self._sock.recv_into(b)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1241, in recv_into
+    return self.read(nbytes, buffer)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1099, in read
+    return self._sslobj.read(len, buffer)
+socket.timeout: The read operation timed out
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 464, in send
+    urllib_response = conn.urlopen(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 527, in increment
+    raise six.reraise(type(error), error, _stacktrace)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/packages/six.py", line 770, in reraise
+    raise value
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 470, in _make_request
+    self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 358, in _raise_timeout
+    raise ReadTimeoutError(
+urllib3.exceptions.ReadTimeoutError: AWSHTTPSConnectionPool(host='sqs.ap-south-1.amazonaws.com', port=443): Read timed out. (read timeout=60)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend copy/worker.py", line 509, in worker_loop
+    messages = queue.receive_messages(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/factory.py", line 581, in do_action
+    response = action(self, *args, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/action.py", line 88, in __call__
+    response = getattr(parent.meta.client, operation_name)(*args, **params)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 569, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1005, in _make_api_call
+    http, parsed_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1029, in _make_request
+    return self._endpoint.make_request(operation_model, request_dict)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 119, in make_request
+    return self._send_request(request_dict, operation_model)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 200, in _send_request
+    while self._needs_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 360, in _needs_retry
+    responses = self._event_emitter.emit(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 412, in emit
+    return self._emitter.emit(aliased_event_name, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 256, in emit
+    return self._emit(event_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 239, in _emit
+    response = handler(**kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 207, in __call__
+    if self._checker(**checker_kwargs):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 284, in __call__
+    should_retry = self._should_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 320, in _should_retry
+    return self._checker(attempt_number, response, caught_exception)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 363, in __call__
+    checker_response = checker(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 247, in __call__
+    return self._check_caught_exception(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 416, in _check_caught_exception
+    raise caught_exception
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 279, in _do_get_response
+    http_response = self._send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 383, in _send
+    return self.http_session.send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 501, in send
+    raise ReadTimeoutError(endpoint_url=request.url, error=e)
+botocore.exceptions.ReadTimeoutError: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+2025-09-29 08:31:49,733 ERROR Worker loop unexpected error: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 468, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 463, in _make_request
+    httplib_response = conn.getresponse()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 1349, in getresponse
+    response.begin()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 316, in begin
+    version, status, reason = self._read_status()
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/http/client.py", line 277, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 704, in readinto
+    return self._sock.recv_into(b)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1241, in recv_into
+    return self.read(nbytes, buffer)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/ssl.py", line 1099, in read
+    return self._sslobj.read(len, buffer)
+socket.timeout: The read operation timed out
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 464, in send
+    urllib_response = conn.urlopen(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 527, in increment
+    raise six.reraise(type(error), error, _stacktrace)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/packages/six.py", line 770, in reraise
+    raise value
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 470, in _make_request
+    self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 358, in _raise_timeout
+    raise ReadTimeoutError(
+urllib3.exceptions.ReadTimeoutError: AWSHTTPSConnectionPool(host='sqs.ap-south-1.amazonaws.com', port=443): Read timed out. (read timeout=60)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend copy/worker.py", line 509, in worker_loop
+    messages = queue.receive_messages(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/factory.py", line 581, in do_action
+    response = action(self, *args, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/boto3/resources/action.py", line 88, in __call__
+    response = getattr(parent.meta.client, operation_name)(*args, **params)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 569, in _api_call
+    return self._make_api_call(operation_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1005, in _make_api_call
+    http, parsed_response = self._make_request(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/client.py", line 1029, in _make_request
+    return self._endpoint.make_request(operation_model, request_dict)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 119, in make_request
+    return self._send_request(request_dict, operation_model)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 200, in _send_request
+    while self._needs_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 360, in _needs_retry
+    responses = self._event_emitter.emit(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 412, in emit
+    return self._emitter.emit(aliased_event_name, **kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 256, in emit
+    return self._emit(event_name, kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/hooks.py", line 239, in _emit
+    response = handler(**kwargs)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 207, in __call__
+    if self._checker(**checker_kwargs):
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 284, in __call__
+    should_retry = self._should_retry(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 320, in _should_retry
+    return self._checker(attempt_number, response, caught_exception)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 363, in __call__
+    checker_response = checker(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 247, in __call__
+    return self._check_caught_exception(
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/retryhandler.py", line 416, in _check_caught_exception
+    raise caught_exception
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 279, in _do_get_response
+    http_response = self._send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/endpoint.py", line 383, in _send
+    return self.http_session.send(request)
+  File "/Users/madhushreegm/Desktop/infra.ai_backend/.venv/lib/python3.9/site-packages/botocore/httpsession.py", line 501, in send
+    raise ReadTimeoutError(endpoint_url=request.url, error=e)
+botocore.exceptions.ReadTimeoutError: Read timeout on endpoint URL: "https://sqs.ap-south-1.amazonaws.com/"
+2025-09-29 10:29:43,826 DEBUG No messages received; continuing
+2025-09-29 11:24:30,290 DEBUG No messages received; continuing
+2025-10-04 17:11:33,599 INFO Worker started - monitoring incident queue
+2025-10-04 17:11:54,298 DEBUG No messages received; continuing
+2025-10-04 17:12:14,537 DEBUG No messages received; continuing
+2025-10-04 17:12:35,584 DEBUG No messages received; continuing
+2025-10-04 17:12:55,857 DEBUG No messages received; continuing
+2025-10-04 17:13:16,107 DEBUG No messages received; continuing
+2025-10-04 17:13:37,690 DEBUG No messages received; continuing
+2025-10-04 17:13:58,017 DEBUG No messages received; continuing
+2025-10-04 17:14:18,242 DEBUG No messages received; continuing
+2025-10-04 17:14:39,141 DEBUG No messages received; continuing
+2025-10-04 17:14:59,385 DEBUG No messages received; continuing
+2025-10-04 17:15:19,633 DEBUG No messages received; continuing
+2025-10-04 17:15:40,576 DEBUG No messages received; continuing
+2025-10-04 17:16:00,841 DEBUG No messages received; continuing
+2025-10-04 17:16:21,072 DEBUG No messages received; continuing
+2025-10-04 17:16:41,521 DEBUG No messages received; continuing
+2025-10-04 17:17:04,276 DEBUG No messages received; continuing
+2025-10-04 17:17:24,538 DEBUG No messages received; continuing
+2025-10-04 17:17:44,766 DEBUG No messages received; continuing
+2025-10-04 17:18:05,574 DEBUG No messages received; continuing
+2025-10-04 17:18:25,801 DEBUG No messages received; continuing
+2025-10-04 17:18:47,439 DEBUG No messages received; continuing
+2025-10-04 17:19:07,689 DEBUG No messages received; continuing
+2025-10-04 17:19:27,916 DEBUG No messages received; continuing
+2025-10-04 17:19:49,098 DEBUG No messages received; continuing
+2025-10-04 17:20:09,375 DEBUG No messages received; continuing
+2025-10-04 17:20:29,591 DEBUG No messages received; continuing
+2025-10-04 17:20:49,941 DEBUG No messages received; continuing
+2025-10-04 17:21:10,563 DEBUG No messages received; continuing
+2025-12-13 12:12:42,004 INFO Worker started - monitoring incident queue
+2025-12-13 12:13:02,377 DEBUG No messages received; continuing
+2025-12-13 12:13:24,134 DEBUG No messages received; continuing
+2025-12-13 12:13:44,919 DEBUG No messages received; continuing
+2025-12-13 12:14:05,131 DEBUG No messages received; continuing
+2025-12-13 12:14:25,586 DEBUG No messages received; continuing
+2025-12-13 12:14:45,815 DEBUG No messages received; continuing
+2025-12-13 12:15:06,059 DEBUG No messages received; continuing
+2025-12-13 12:15:26,262 DEBUG No messages received; continuing
+2025-12-13 12:15:47,063 DEBUG No messages received; continuing
+2025-12-13 12:16:07,318 DEBUG No messages received; continuing
+2025-12-13 12:16:27,826 DEBUG No messages received; continuing
+2025-12-13 12:16:48,054 DEBUG No messages received; continuing
+2025-12-13 12:17:08,982 DEBUG No messages received; continuing
+2025-12-13 12:17:29,257 DEBUG No messages received; continuing
+2025-12-13 12:17:49,466 DEBUG No messages received; continuing
+2025-12-13 12:18:09,686 DEBUG No messages received; continuing
+2025-12-13 12:18:29,914 DEBUG No messages received; continuing
+2025-12-13 12:18:50,169 DEBUG No messages received; continuing
+2025-12-13 12:19:10,691 DEBUG No messages received; continuing
+2025-12-13 12:19:31,335 DEBUG No messages received; continuing
+2025-12-13 12:19:51,564 DEBUG No messages received; continuing
+2025-12-13 12:20:12,146 DEBUG No messages received; continuing
+2025-12-13 12:20:32,347 DEBUG No messages received; continuing
+2025-12-13 12:20:52,575 DEBUG No messages received; continuing
+2025-12-13 12:21:12,824 DEBUG No messages received; continuing
+2025-12-13 12:21:33,064 DEBUG No messages received; continuing
+2025-12-13 12:21:53,437 DEBUG No messages received; continuing
+2025-12-13 12:22:13,681 DEBUG No messages received; continuing
+2025-12-13 12:22:33,948 DEBUG No messages received; continuing
+2025-12-13 12:22:54,229 DEBUG No messages received; continuing
+2025-12-13 12:23:14,474 DEBUG No messages received; continuing
+2025-12-13 12:23:34,695 DEBUG No messages received; continuing
+2025-12-13 12:23:54,981 DEBUG No messages received; continuing
+2025-12-13 12:24:03,203 INFO Worker started - monitoring incident queue
+2025-12-13 12:24:23,495 DEBUG No messages received; continuing
+2025-12-13 12:24:43,721 DEBUG No messages received; continuing
+2025-12-13 12:25:04,047 DEBUG No messages received; continuing
+2025-12-13 12:25:24,626 DEBUG No messages received; continuing
+2025-12-13 12:25:44,849 DEBUG No messages received; continuing
+2025-12-13 12:26:05,074 DEBUG No messages received; continuing
+2025-12-13 12:26:25,303 DEBUG No messages received; continuing
+2025-12-13 12:26:45,875 DEBUG No messages received; continuing
+2025-12-13 12:27:06,087 DEBUG No messages received; continuing
+2025-12-13 12:27:27,111 DEBUG No messages received; continuing
+2025-12-13 12:27:47,349 DEBUG No messages received; continuing
+2025-12-13 12:28:07,561 DEBUG No messages received; continuing
+2025-12-13 12:28:27,830 DEBUG No messages received; continuing
+2025-12-13 12:28:48,127 DEBUG No messages received; continuing
+2025-12-13 12:29:09,621 DEBUG No messages received; continuing
+2025-12-13 12:29:29,912 DEBUG No messages received; continuing
+2025-12-13 12:29:50,966 DEBUG No messages received; continuing
+2025-12-13 12:30:11,197 DEBUG No messages received; continuing
+2025-12-13 12:30:31,948 DEBUG No messages received; continuing
+2025-12-13 12:30:52,206 DEBUG No messages received; continuing
+2025-12-13 12:31:12,431 DEBUG No messages received; continuing
+2025-12-13 12:31:32,634 DEBUG No messages received; continuing
+2025-12-13 12:31:52,872 DEBUG No messages received; continuing
+2025-12-13 12:32:13,071 DEBUG No messages received; continuing
+2025-12-13 12:32:33,415 DEBUG No messages received; continuing
+2025-12-13 12:32:53,613 DEBUG No messages received; continuing
+2025-12-13 12:33:00,015 INFO Worker started - monitoring incident queue
+2025-12-13 12:33:20,381 DEBUG No messages received; continuing
+2025-12-13 12:33:40,947 DEBUG No messages received; continuing
+2025-12-13 12:34:01,177 DEBUG No messages received; continuing
+2025-12-13 12:34:21,368 DEBUG No messages received; continuing
+2025-12-13 12:34:41,575 DEBUG No messages received; continuing
+2025-12-13 12:35:01,817 DEBUG No messages received; continuing
+2025-12-13 12:35:22,191 DEBUG No messages received; continuing
+2025-12-13 12:35:42,433 DEBUG No messages received; continuing
+2025-12-13 12:36:02,650 DEBUG No messages received; continuing
+2025-12-13 12:36:22,883 DEBUG No messages received; continuing
+2025-12-13 12:36:38,900 INFO Worker started - monitoring incident queue
+2025-12-13 12:36:59,185 DEBUG No messages received; continuing
+2025-12-13 12:37:19,498 DEBUG No messages received; continuing
+2025-12-13 12:37:39,867 DEBUG No messages received; continuing
+2025-12-13 12:38:00,128 DEBUG No messages received; continuing
+2025-12-13 12:38:20,331 DEBUG No messages received; continuing
+2025-12-13 12:38:40,557 DEBUG No messages received; continuing
+2025-12-13 12:39:00,788 DEBUG No messages received; continuing
+2025-12-13 12:39:21,055 DEBUG No messages received; continuing
+2025-12-13 12:39:41,278 DEBUG No messages received; continuing
+2025-12-13 12:40:01,525 DEBUG No messages received; continuing
+2025-12-13 12:40:21,757 DEBUG No messages received; continuing
+2025-12-13 12:40:42,515 DEBUG No messages received; continuing
+2025-12-13 12:41:03,218 DEBUG No messages received; continuing
+2025-12-13 12:41:23,458 DEBUG No messages received; continuing
+2025-12-13 12:41:43,930 DEBUG No messages received; continuing
+2025-12-13 12:42:04,159 DEBUG No messages received; continuing
+2025-12-13 12:42:24,859 DEBUG No messages received; continuing

@@ -8,7 +8,7 @@ import time
 AWS_ACCESS_KEY = os.getenv("access_key")       # export access_key=...
 AWS_SECRET_KEY = os.getenv("secrete_access")    # export secret_access=...
 REGION = "ap-south-1"
-ACCOUNT_ID = "os.gentenv("account_id")
+ACCOUNT_ID = os.getenv("account_id")
 
 BUCKET = "my-ansible-runtime-bucket"  # must exist already
 CLUSTER_NAME = "ansible-runner-cluster"
