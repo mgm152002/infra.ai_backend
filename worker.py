@@ -12,6 +12,11 @@ from datetime import datetime
 import traceback
 import logging
 from logging.handlers import RotatingFileHandler
+from pinecone import Pinecone
+from openai import OpenAI
+from typing import List, Optional, Dict, Any
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # --- CONFIG ---
 LOG_FILE = "infra_worker.log"
@@ -35,8 +40,66 @@ session = boto3.Session(
     region_name='ap-south-1'
 )
 
+SQS_QUEUE_NAME = os.getenv("SQS_QUEUE_NAME", "infraaiqueue.fifo")
+# Default per-message visibility timeout in seconds. Should be >= max expected processing time.
+SQS_VISIBILITY_TIMEOUT = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "900"))
+
 # Initialize Gemini
 genai.configure(api_key=os.getenv('Gemini_Api_Key'))
+
+# Knowledge base (Pinecone + OpenRouter embeddings) configuration
+PINECONE_KB_INDEX_NAME = os.getenv("PINECONE_KB_INDEX_NAME", "infraai")
+KB_TOP_K_DEFAULT = int(os.getenv("KB_TOP_K_DEFAULT", "5"))
+KB_SCORE_THRESHOLD_DEFAULT = float(os.getenv("KB_SCORE_THRESHOLD_DEFAULT", "0.7"))
+
+OPENROUTER_API_KEY = os.getenv("openrouter")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL")
+OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME")
+DEFAULT_MODEL_NAME = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+
+embedding_client: Optional[OpenAI] = None
+if OPENROUTER_API_KEY:
+    embedding_client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+    )
+
+pc = None
+try:
+    pinecone_api_key = os.getenv("Pinecone_Api_Key")
+    if pinecone_api_key:
+        pc = Pinecone(api_key=pinecone_api_key)
+except Exception:
+    pc = None  # handled gracefully during lookup
+
+
+def get_llm(model_name: Optional[str] = None, **kwargs) -> ChatOpenAI:
+    """Return a ChatOpenAI instance configured to talk to OpenRouter for worker tasks."""
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OpenRouter API key not set. Please define the 'openrouter' environment variable.")
+    return ChatOpenAI(
+        model=model_name or DEFAULT_MODEL_NAME,
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        **kwargs,
+    )
+
+
+def call_llm(
+    user_content: str,
+    *,
+    system_content: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> str:
+    """Single-turn helper that sends a prompt to OpenRouter and returns the response text."""
+    messages: List = []
+    if system_content:
+        messages.append(SystemMessage(content=system_content))
+    messages.append(HumanMessage(content=user_content))
+    llm = get_llm(model_name=model_name)
+    response = llm.invoke(messages)
+    return response.content
 
 SYSTEM_PROMPT = '''You are an AI incident resolver agent. When given an incident description, create a structured plan with these steps:
 1. Collect diagnostic information (logs, metrics, system state)
@@ -117,6 +180,238 @@ def make_ctx_logger(base_logger, incident=None, instance=None, user=None):
         def exception(self, msg, *args, **kwargs):
             base_logger.exception(f"{prefix} {msg}", *args, **kwargs)
     return Ctx()
+
+
+def _get_kb_index(ctx_logger=None):
+    l = ctx_logger or logger
+    if pc is None:
+        l.debug("Pinecone client not configured; skipping knowledge base lookups")
+        return None
+    try:
+        return pc.Index(PINECONE_KB_INDEX_NAME)
+    except Exception as e:
+        l.warning(f"Knowledge base index '{PINECONE_KB_INDEX_NAME}' is not available: {str(e)}")
+        return None
+
+
+def _embed_texts(texts: List[str], ctx_logger=None) -> List[List[float]]:
+    l = ctx_logger or logger
+    if not texts:
+        return []
+    if embedding_client is None:
+        l.debug("Embedding client not configured; skipping knowledge base lookups")
+        return []
+    try:
+        extra_headers: Dict[str, str] = {}
+        if OPENROUTER_SITE_URL:
+            extra_headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_SITE_NAME:
+            extra_headers["X-Title"] = OPENROUTER_SITE_NAME
+
+        kwargs: Dict[str, Any] = {
+            "model": "openai/text-embedding-ada-002",
+            "input": texts,
+            "encoding_format": "float",
+        }
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+
+        response = embedding_client.embeddings.create(**kwargs)
+        return [item.embedding for item in response.data]
+    except Exception as e:
+        l.warning(f"Failed to compute embeddings for knowledge base: {str(e)}")
+        return []
+
+
+def query_knowledge_base(
+    query: str,
+    top_k: int = KB_TOP_K_DEFAULT,
+    score_threshold: float = KB_SCORE_THRESHOLD_DEFAULT,
+    ctx_logger=None,
+) -> List[dict]:
+    l = ctx_logger or logger
+    if not query or not query.strip():
+        return []
+
+    index = _get_kb_index(ctx_logger=l)
+    if index is None:
+        return []
+
+    embeddings = _embed_texts([query], ctx_logger=l)
+    if not embeddings:
+        return []
+
+    try:
+        res = index.query(
+            vector=embeddings[0],
+            top_k=top_k,
+            include_metadata=True,
+        )
+    except Exception as e:
+        l.warning(f"Failed to query knowledge base: {str(e)}")
+        return []
+
+    matches_raw = []
+    if isinstance(res, dict):
+        matches_raw = res.get("matches", [])
+    elif hasattr(res, "to_dict"):
+        res_dict = res.to_dict()
+        matches_raw = res_dict.get("matches", [])
+    elif hasattr(res, "matches"):
+        matches_raw = res.matches
+
+    matches: List[dict] = []
+    for m in matches_raw or []:
+        if isinstance(m, dict):
+            score = m.get("score")
+            metadata = m.get("metadata") or {}
+        else:
+            score = getattr(m, "score", None)
+            metadata = getattr(m, "metadata", {}) or {}
+        if score is None:
+            continue
+        if score_threshold is not None and float(score) < float(score_threshold):
+            continue
+        matches.append(
+            {
+                "score": float(score),
+                "text": metadata.get("text", ""),
+                "source": metadata.get("source_file_name") or metadata.get("source") or "",
+                "doc_id": metadata.get("doc_id") or "",
+                "chunk_index": metadata.get("chunk_index"),
+            }
+        )
+    return matches
+
+
+def get_incident_runbook_context(incident: dict, ctx_logger=None) -> dict:
+    l = ctx_logger or logger
+    try:
+        query_parts = [
+            f"Incident {incident.get('inc_number', '')}",
+            incident.get('subject') or "",
+            incident.get('message') or "",
+        ]
+        query = " - ".join(p for p in query_parts if p)
+        l.info("Querying knowledge base for incident runbooks/SOPs")
+        matches = query_knowledge_base(query, ctx_logger=l)
+        if not matches:
+            l.info("No matching runbooks/SOPs found in knowledge base")
+            return {"has_knowledge": False, "matches": [], "combined_context": ""}
+        combined = "\n\n".join(m["text"] for m in matches if m.get("text"))
+        l.info(f"Found {len(matches)} knowledge base matches for incident")
+        return {
+            "has_knowledge": True,
+            "matches": matches,
+            "combined_context": combined,
+        }
+    except Exception as e:
+        l.warning(f"Knowledge base lookup failed; continuing without runbooks: {str(e)}")
+        return {"has_knowledge": False, "matches": [], "combined_context": ""}
+
+
+def get_prometheus_config_for_user(user_id: Any, ctx_logger=None) -> Optional[dict]:
+    """Fetch Prometheus datasource configuration for the given user (if any).
+
+    Expects a Supabase table `PrometheusConfigs` with at least:
+      - id (PK)
+      - user_id (FK to Users.id)
+      - base_url
+      - auth_type (e.g. 'none' or 'bearer')
+      - bearer_token (optional)
+    """
+    l = ctx_logger or logger
+    if user_id is None:
+        return None
+    try:
+        resp = supabase.table("PrometheusConfigs").select("*").eq("user_id", user_id).limit(1).execute()
+        data = getattr(resp, "data", None) or []
+        if not data:
+            l.info(f"No Prometheus configuration found for user_id={user_id}")
+            return None
+        l.info(f"Prometheus configuration found for user_id={user_id}")
+        return data[0]
+    except Exception as e:
+        l.warning(f"Failed to fetch Prometheus configuration for user_id={user_id}: {str(e)}")
+        return None
+
+
+def fetch_prometheus_metrics(prom_cfg: dict, cmdb: dict, incident: dict, ctx_logger=None) -> str:
+    """Query Prometheus for basic host metrics for this incident.
+
+    Returns a JSON string summarizing the queries and results, or an empty
+    string if anything fails. This JSON is intended to be passed as context
+    into the diagnostic LLM prompt.
+    """
+    l = ctx_logger or logger
+    base_url = (prom_cfg.get("base_url") or "").rstrip("/")
+    if not base_url:
+        l.warning("Prometheus configuration missing base_url; skipping metrics collection")
+        return ""
+
+    instance_ip = cmdb.get("ip")
+    if not instance_ip:
+        l.warning("CMDB entry missing 'ip'; cannot form Prometheus instance label")
+        return ""
+
+    # Common default for node_exporter targets
+    instance_label = f"{instance_ip}:9100"
+
+    queries: Dict[str, str] = {
+        "up": f'up{{instance="{instance_label}"}}',
+        "cpu_5m": f'avg(rate(node_cpu_seconds_total{{mode!="idle",instance="{instance_label}"}}[5m]))',
+        "load1": f'avg_over_time(node_load1{{instance="{instance_label}"}}[5m])',
+        "mem_used_ratio": (
+            f'(1 - (node_memory_MemAvailable_bytes{{instance="{instance_label}"}} '
+            f'/ node_memory_MemTotal_bytes{{instance="{instance_label}"}}))'
+        ),
+    }
+
+    headers: Dict[str, str] = {}
+    auth_type = (prom_cfg.get("auth_type") or "none").lower()
+    bearer_token = prom_cfg.get("bearer_token")
+    if auth_type == "bearer" and bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+
+    metrics_results: Dict[str, Any] = {}
+    for name, query in queries.items():
+        try:
+            resp = requests.get(
+                f"{base_url}/api/v1/query",
+                params={"query": query},
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("status") != "success":
+                l.warning(f"Prometheus query '{name}' returned non-success status: {body.get('status')}")
+                continue
+            result = body.get("data", {}).get("result", [])
+            metrics_results[name] = result
+        except Exception as e:
+            l.warning(f"Prometheus query '{name}' failed: {str(e)}")
+
+    if not metrics_results:
+        l.info("No Prometheus metrics available for this incident/instance")
+        return ""
+
+    try:
+        summary = json.dumps(
+            {
+                "prometheus_base_url": base_url,
+                "instance": instance_label,
+                "incident_number": incident.get("inc_number"),
+                "queries": queries,
+                "results": metrics_results,
+            },
+            indent=2,
+        )
+        return summary
+    except Exception as e:
+        l.warning(f"Failed to serialize Prometheus metrics to JSON: {str(e)}")
+        return ""
+
 
 # --- Utility functions ---
 def get_username(os_type: str) -> str:
@@ -267,23 +562,58 @@ def get_ssh_key(mail: str, ctx_logger=None) -> bool:
         l.exception(f"Error fetching SSH key: {str(e)}")
         return False
 
-def collect_diagnostics(incident: dict, cmdb: dict, ctx_logger=None) -> dict:
+def collect_diagnostics(
+    incident: dict,
+    cmdb: dict,
+    kb_context: str = "",
+    prometheus_context: str = "",
+    ctx_logger=None,
+) -> dict:
     l = ctx_logger or logger
-    model = genai.GenerativeModel("gemini-2.0-flash-exp")
+
+    if kb_context:
+        kb_block = f"""
+Known runbook / SOP context from the internal knowledge base:
+{kb_context}
+
+Use the above runbook instructions as your primary guidance when creating the plan.
+Where the runbook is incomplete or ambiguous, you may fall back to your own best practices.
+"""
+    else:
+        kb_block = """
+No specific runbook or SOP context was found in the internal knowledge base for this incident.
+Proceed with your default troubleshooting approach based on the incident details and system information.
+"""
+
+    if prometheus_context:
+        prom_block = f"""
+Additional Prometheus metrics for this incident (JSON from Prometheus HTTP API):
+
+{prometheus_context}
+
+Use this metrics context when deciding what diagnostics to run and how to prioritize checks.
+"""
+    else:
+        prom_block = """
+No Prometheus metrics could be retrieved for this incident. Proceed without using Prometheus data.
+"""
+
     prompt = f"""
 Incident: {incident.get('subject')} - {incident.get('message')}
 System: {cmdb.get('os')} at {cmdb.get('ip')}
 
+{kb_block}
+{prom_block}
 Create a diagnostic plan with specific commands to collect information.
 {SYSTEM_PROMPT}
 """
-    l.info("Requesting diagnostic plan from AI")
+    l.info("Requesting diagnostic plan from AI (OpenRouter)")
     l.debug(f"AI prompt (truncated): {truncate(prompt)}")
     try:
-        response = model.generate_content(prompt)
+        response_text = call_llm(prompt)
         l.info("AI diagnostic plan received")
-        l.debug(f"AI response (truncated): {truncate(response.text)}")
-        plan_json = extract_json(response.text, ctx_logger=l)
+        l.debug(f"AI response (truncated): {truncate(response_text)}")
+        plan_json = extract_json(response_text, ctx_logger=l)
     except Exception as e:
         l.exception(f"AI call for diagnostics failed: {str(e)}")
         plan_json = {"todos": []}
@@ -313,7 +643,6 @@ Create a diagnostic plan with specific commands to collect information.
 
 def analyze_diagnostics(diagnostics: dict, incident: dict, ctx_logger=None) -> dict:
     l = ctx_logger or logger
-    model = genai.GenerativeModel("gemini-2.0-flash-exp")
     prompt = f"""
 Incident: {incident.get('subject')} - {incident.get('message')}
 Diagnostic results:
@@ -331,13 +660,13 @@ Return in JSON format:
   "verification": "how to verify"
 }}
 """
-    l.info("Sending diagnostics to AI for analysis")
+    l.info("Sending diagnostics to AI for analysis (OpenRouter)")
     l.debug(f"AI analysis prompt (truncated): {truncate(prompt)}")
     try:
-        response = model.generate_content(prompt)
+        response_text = call_llm(prompt)
         l.info("AI analysis response received")
-        l.debug(f"AI response (truncated): {truncate(response.text)}")
-        parsed = extract_json(response.text, ctx_logger=l)
+        l.debug(f"AI response (truncated): {truncate(response_text)}")
+        parsed = extract_json(response_text, ctx_logger=l)
         return parsed
     except Exception as e:
         l.exception(f"AI analysis failed: {str(e)}")
@@ -353,7 +682,6 @@ def execute_resolution(resolution: dict, cmdb: dict, ctx_logger=None) -> dict:
     for idx, step in enumerate(resolution.get('resolution_steps', []), start=1):
         l.info(f"Generating command for resolution step {idx}: {step}")
         try:
-            model = genai.GenerativeModel("gemini-2.0-flash-exp")
             cmd_prompt = f"""
 For resolution step: {step}
 System: {cmdb.get('os')} at {cmdb.get('ip')}
@@ -362,8 +690,8 @@ Generate a specific, non-interactive command to execute this step.
 Return ONLY the command string.
 """
             l.debug(f"Command-generation prompt (truncated): {truncate(cmd_prompt)}")
-            response = model.generate_content(cmd_prompt)
-            command = response.text.strip().replace('```', '').replace('bash', '')
+            response_text = call_llm(cmd_prompt)
+            command = response_text.strip().replace('```', '').replace('bash', '')
             command = truncate(command, 4000)  # command may be long; keep manageable in logs
             l.info(f"Generated command (truncated): {truncate(command)}")
         except Exception as e:
@@ -385,23 +713,83 @@ Return ONLY the command string.
 
     return {"resolution_results": results}
 
-def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
+
+def update_incident_state(inc_number: Optional[str], state: str, solution: Optional[dict] = None, ctx_logger=None) -> None:
+    """Safely update incident state (and optional solution) in Supabase.
+
+    This centralizes state transitions so they stay consistent across success,
+    validation errors, and unexpected exceptions.
+    """
+    l = ctx_logger or logger
+    if not inc_number:
+        l.warning("Cannot update incident state: missing inc_number")
+        return
+    try:
+        update_data: Dict[str, Any] = {
+            "state": state,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if solution is not None:
+            update_data["solution"] = json.dumps(solution)
+        supabase.table("Incidents").update(update_data).eq("inc_number", inc_number).execute()
+        l.info(f"Incident {inc_number} state updated to '{state}'")
+    except Exception as e:
+        l.exception(f"Failed to update incident {inc_number} state to '{state}': {str(e)}")
+
+
+
+def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_logger=None) -> dict:
     # Create context-aware logger for this incident
     email = None
-    ctx = ctx_logger or make_ctx_logger(logger, incident=mail.get('inc_number'), instance=aws.get('instance_id'), user=None)
+    meta = meta or {}
+    instance_label = meta.get('tag_id') or aws.get('instance_id')
+    ctx = ctx_logger or make_ctx_logger(logger, incident=mail.get('inc_number'), instance=instance_label, user=None)
     ctx.info("Processing incident started")
     try:
+        inc_number = mail.get('inc_number')
+        # Mark incident as actively being processed (was previously just "in queue")
+        update_incident_state(inc_number, "Processing", ctx_logger=ctx)
+
         ctx.info("Fetching CMDB entry from Supabase")
-        cmdb_response = supabase.table("CMDB").select("*").eq("tag_id", aws.get('instance_id')).execute()
 
-        # SAFE check: APIResponse has .data, do not call .get() on the APIResponse object
-        if not getattr(cmdb_response, "data", None):
-            ctx.error("CMDB entry not found")
+        cmdb = None
+        # Primary lookup: use Meta.tag_id (and Meta.user_id if present) from the SQS message
+        meta_tag_id = meta.get('tag_id')
+        if meta_tag_id:
+            ctx.info(f"Attempting CMDB lookup using Meta.tag_id='{meta_tag_id}'")
+            cmdb_query = supabase.table("CMDB").select("*").eq("tag_id", meta_tag_id)
+            meta_user_id = meta.get('user_id')
+            if meta_user_id is not None:
+                cmdb_query = cmdb_query.eq("user_id", meta_user_id)
+            meta_cmdb_response = cmdb_query.execute()
+            if getattr(meta_cmdb_response, "data", None):
+                cmdb = meta_cmdb_response.data[0]
+                ctx.info(f"CMDB entry found via Meta.tag_id: {truncate(json.dumps(cmdb), 1000)}")
+
+        # Fallback lookup: use Aws.instance_id as tag_id (legacy behaviour)
+        if cmdb is None:
+            instance_tag = aws.get('instance_id')
+            ctx.info(f"Falling back to CMDB lookup using Aws.instance_id as tag_id: '{instance_tag}'")
+            if instance_tag:
+                cmdb_response = supabase.table("CMDB").select("*").eq("tag_id", instance_tag).execute()
+
+                # SAFE check: APIResponse has .data, do not call .get() on the APIResponse object
+                if getattr(cmdb_response, "data", None):
+                    cmdb = cmdb_response.data[0]
+                    ctx.info(f"CMDB entry found via Aws.instance_id: {truncate(json.dumps(cmdb), 1000)}")
+
+        if cmdb is None:
+            ctx.error("CMDB entry not found (checked Meta.tag_id and Aws.instance_id)")
+            update_incident_state(
+                mail.get('inc_number'),
+                "Error",
+                solution={
+                    "error": "CMDB entry not found",
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+                ctx_logger=ctx,
+            )
             return {"status": "error", "message": "CMDB entry not found"}
-
-        # Use the .data attribute (it's a list of rows)
-        cmdb = cmdb_response.data[0]
-        ctx.info(f"CMDB entry found: {truncate(json.dumps(cmdb), 1000)}")
 
         ctx.info("Fetching user email from Supabase Users table")
         user_response = supabase.table("Users").select("email").eq("id", cmdb.get('user_id')).execute()
@@ -409,6 +797,15 @@ def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
         # SAFE check for user_response
         if not getattr(user_response, "data", None):
             ctx.error("User not found in Supabase")
+            update_incident_state(
+                mail.get('inc_number'),
+                "Error",
+                solution={
+                    "error": "User not found in Supabase",
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+                ctx_logger=ctx,
+            )
             return {"status": "error", "message": "User not found"}
 
         # Extract email from .data
@@ -419,10 +816,40 @@ def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
         ctx.info("Fetching SSH key")
         if not get_ssh_key(email, ctx_logger=ctx):
             ctx.error("Failed to fetch SSH key from Infisical")
+            update_incident_state(
+                mail.get('inc_number'),
+                "Error",
+                solution={
+                    "error": "Failed to fetch SSH key from Infisical",
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+                ctx_logger=ctx,
+            )
             return {"status": "error", "message": "Failed to fetch SSH key"}
 
+        ctx.info("Checking knowledge base for runbooks/SOPs for this incident")
+        kb_info = get_incident_runbook_context(mail, ctx_logger=ctx)
+
+        # Optional Prometheus metrics context (if the user has configured a Prometheus data source)
+        prometheus_context = ""
+        user_id = cmdb.get('user_id')
+        if user_id is not None:
+            ctx.info("Checking for Prometheus configuration for this user")
+            prom_cfg = get_prometheus_config_for_user(user_id, ctx_logger=ctx)
+            if prom_cfg:
+                ctx.info("Fetching Prometheus metrics for this incident")
+                prometheus_context = fetch_prometheus_metrics(prom_cfg, cmdb, mail, ctx_logger=ctx)
+            else:
+                ctx.info("No Prometheus configuration found; skipping Prometheus metrics")
+
         ctx.info("Collecting diagnostics")
-        diagnostics = collect_diagnostics(mail, cmdb, ctx_logger=ctx)
+        diagnostics = collect_diagnostics(
+            mail,
+            cmdb,
+            kb_context=kb_info.get("combined_context", "") if kb_info else "",
+            prometheus_context=prometheus_context,
+            ctx_logger=ctx,
+        )
 
         ctx.info("Analyzing diagnostics")
         analysis = analyze_diagnostics(diagnostics, mail, ctx_logger=ctx)
@@ -434,15 +861,30 @@ def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
         status = "Resolved" if is_resolved else "Partially Resolved"
         ctx.info(f"Final status determined: {status}")
 
+        solution_payload = {
+            "root_cause": analysis.get('root_cause', ''),
+            "resolution_steps": analysis.get('resolution_steps', []),
+            "runbook_used": bool(kb_info.get("has_knowledge")) if kb_info else False,
+        }
+        if kb_info and kb_info.get("has_knowledge"):
+            # Store lightweight metadata about matched runbooks for traceability
+            solution_payload["runbook_matches"] = [
+                {
+                    "score": m.get("score"),
+                    "source": m.get("source"),
+                    "doc_id": m.get("doc_id"),
+                    "chunk_index": m.get("chunk_index"),
+                }
+                for m in kb_info.get("matches", [])
+            ]
+
         ctx.info("Updating incident record in Supabase")
-        supabase.table("Incidents").update({
-            "state": status,
-            "solution": json.dumps({
-                "root_cause": analysis.get('root_cause', ''),
-                "resolution_steps": analysis.get('resolution_steps', [])
-            }),
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("inc_number", mail.get('inc_number')).execute()
+        update_incident_state(
+            mail.get('inc_number'),
+            status,
+            solution=solution_payload,
+            ctx_logger=ctx,
+        )
         ctx.info("Updated Incidents table")
 
         ctx.info("Inserting result record into Results table")
@@ -451,7 +893,8 @@ def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
             "description": json.dumps({
                 "diagnostics": diagnostics,
                 "analysis": analysis,
-                "resolution": resolution
+                "resolution": resolution,
+                "knowledge_base": kb_info,
             }),
             "short_description": analysis.get('root_cause', mail.get('subject')),
             "created_at": datetime.utcnow().isoformat()
@@ -462,7 +905,8 @@ def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
             "status": status,
             "diagnostics": diagnostics,
             "analysis": analysis,
-            "resolution": resolution
+            "resolution": resolution,
+            "knowledge_base": kb_info,
         }
 
     except Exception as e:
@@ -477,17 +921,15 @@ def process_incident(aws: dict, mail: dict, ctx_logger=None) -> dict:
         }
 
         ctx.info("Updating incident with error details in Supabase")
-        try:
-            supabase.table("Incidents").update({
-                "state": "Error",
-                "solution": json.dumps({
-                    "error": error_details,
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            }).eq("inc_number", mail.get('inc_number')).execute()
-            ctx.info("Supabase incident update succeeded")
-        except Exception:
-            ctx.exception("Failed to update Supabase with error details")
+        update_incident_state(
+            mail.get('inc_number'),
+            "Error",
+            solution={
+                "error": error_details,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            ctx_logger=ctx,
+        )
 
         return {"status": "error", "message": json.dumps(error_details)}
     finally:
@@ -505,7 +947,7 @@ def worker_loop():
     while True:
         try:
             sqs = session.resource('sqs')
-            queue = sqs.get_queue_by_name(QueueName='infraaiqueue.fifo')
+            queue = sqs.get_queue_by_name(QueueName=SQS_QUEUE_NAME)
             messages = queue.receive_messages(
                 MessageAttributeNames=['All'],
                 MaxNumberOfMessages=1,
@@ -520,14 +962,22 @@ def worker_loop():
                     body = json.loads(message.body)
                     aws_data = body.get("Aws", {})
                     mail_data = body.get("Mail", {})
+                    meta_data = body.get("Meta", {})
                     incident_id = mail_data.get('inc_number', 'unknown')
-                    instance_id = aws_data.get('instance_id', 'unknown')
+                    instance_id = meta_data.get('tag_id') or aws_data.get('instance_id', 'unknown')
                     user_email = None
 
                     ctx = make_ctx_logger(logger, incident=incident_id, instance=instance_id, user=None)
                     ctx.info(f"Received SQS message. MessageId={getattr(message, 'message_id', 'unknown')} body(truncated)={truncate(message.body)}")
 
-                    result = process_incident(aws_data, mail_data, ctx_logger=ctx)
+                    # Ensure the message stays invisible for long-running processing.
+                    try:
+                        message.change_visibility(VisibilityTimeout=SQS_VISIBILITY_TIMEOUT)
+                        ctx.info(f"Extended SQS message visibility timeout to {SQS_VISIBILITY_TIMEOUT} seconds")
+                    except Exception:
+                        ctx.exception("Failed to extend SQS message visibility timeout; proceeding with default queue setting")
+
+                    result = process_incident(aws_data, mail_data, meta_data, ctx_logger=ctx)
 
                     if result.get('status') in ['Resolved', 'Partially Resolved']:
                         try:

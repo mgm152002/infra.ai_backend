@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 import subprocess
 from pinecone import Pinecone
+from openai import OpenAI
 import re
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
@@ -48,6 +49,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWTError
 from typing import Annotated
 import asyncio
+import time
 from sse_starlette.sse import EventSourceResponse
 from typing import AsyncGenerator
 
@@ -71,6 +73,20 @@ async def worker_lifespan(app: FastAPI):
     threads = []
     for i in range(worker_count):
         thread = threading.Thread(target=worker_loop, daemon=True, name=f"Worker-{i+1}")
+        thread.start()
+        threads.append(thread)
+
+    # Chat workers for async /chat processing (Chatqueue)
+    try:
+        chat_worker_count = int(os.getenv("CHAT_WORKER_COUNT", "1"))
+    except (TypeError, ValueError):
+        chat_worker_count = 1
+    if chat_worker_count < 1:
+        chat_worker_count = 1
+    chat_worker_count = min(chat_worker_count, 64)
+
+    for i in range(chat_worker_count):
+        thread = threading.Thread(target=chat_worker_loop, daemon=True, name=f"ChatWorker-{i+1}")
         thread.start()
         threads.append(thread)
     
@@ -103,6 +119,10 @@ session = boto3.Session(
     aws_secret_access_key=os.getenv('secrete_access'),
     region_name='ap-south-1'
 )
+
+# SQS/Redis configuration for async chat processing
+CHAT_QUEUE_NAME = "Chatqueue"
+CHAT_JOB_TTL_SECONDS = 60 * 60  # 1 hour TTL for chat job results in Redis
 
 OPENROUTER_API_KEY = os.getenv("openrouter")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -186,7 +206,7 @@ contains the command to run the playbook (use .ini extension for inventory file 
       - variables in vars.yml file include aws_access_key, aws_secret_key, aws_region, everything is default value
       - mention file extensions in  <playbook_run_command> command
       - dont create a recursive playbook where for aws_region make sure not to cause circular dependency
-      - use inventory_file.ini as inventory file and mention inventory_file.ini in playbook_command file 
+      - use inventory_file.ini as inventory file and mention inventory_file.ini in playbook_command file
       - if that module is not installed install it using ansible galaxy in the <shell_commands> section
       - dont use the wrong module for the wrong task
       - access_key,secret_key and region are in vars.yml file include it in the playbook
@@ -207,7 +227,8 @@ contains the command to run the playbook (use .ini extension for inventory file 
    - dont use  associate_public_ip_address: yes in the playbook
    - generate correct commands to install the modules which are required by the task
    - dont use any interactive commands
-   - ansible modules for aws include Community.Aws , amazon.aws · ansible.builtin · ansible.netcommon · ansible.posix · ansible.utils · ansible.windows · arista.eos · awx.awx 
+   - ansible modules for aws include Community.Aws , amazon.aws · ansible.builtin · ansible.netcommon · ansible.posix · ansible.utils · ansible.windows · arista.eos · awx.awx
+   - the sop or instructions you receive may include manual tasks such as going to cloud provider websites (for example the AWS console) and creating VMs/EC2 instances or other resources; instead of returning manual console steps you MUST automate these actions using the correct Ansible AWS modules.
    - just do what is told and dont add any tests to the playbook
    - dont use any interactive commands
    - dont add any extra steps to the playbook
@@ -254,6 +275,12 @@ CHAT_SYSTEM_PROMPT = """You are infra.ai's backend automation assistant.
   - Use them whenever they are relevant to satisfy the user's request.
   - Do not ask the user for parameters that the backend already maintains internally (such as user email / `mail`).
   - For tools that expect a `mail` parameter, rely on the backend to inject this value; you do not need to reason about it or ask the user for it.
+- Before using any other tools or producing a final answer, you MUST first call the `ask_knowledge_base` tool with the user's full request to check for existing SOP/knowledge-base matches.
+- If `ask_knowledge_base` returns `has_knowledge = True`, use the `combined_context` and `matches` from the tool output as primary context for your reasoning.
+- If `ask_knowledge_base` returns `has_knowledge = False`, proceed with your default behavior and other tools.
+- For any user request that describes infrastructure changes, server actions, or SOP-style manual steps (for example: "install docker on this EC2 instance", "go to the AWS console and create a VM", "log in to the server and run these commands"), you MUST call the `infra_automation_ai` tool at least once after `ask_knowledge_base`.
+  - Pass the full user request text, and when useful any SOP / KB instructions, as the `mesaage` argument.
+  - Treat console/UI-based steps (such as going to cloud provider websites and clicking buttons) as input to be automated, not instructions for the user to perform manually.
 - Keep responses concise and focused on incidents and infrastructure tasks.
 - Do not include meta-commentary about prompts, tools, environment variables, JWTs, or Infisical.
 """
@@ -271,6 +298,7 @@ class CMDBItem(BaseModel):
     tag_id: str
     ip: IPvAnyAddress
     addr: str
+    os: str
     type: str
     description: str
     # No need to include user_id in the request body as we'll get it from the token
@@ -289,9 +317,17 @@ class Snow_key(BaseModel):
     snow_user: str
     snow_password: str
 
+
+class PrometheusConfig(BaseModel):
+    name: Optional[str] = None
+    base_url: str
+    auth_type: Optional[str] = "none"  # 'none' or 'bearer'
+    bearer_token: Optional[str] = None
+
+
 class Aws(BaseModel):
     access_key: str
-    secrete_access: str 
+    secrete_access: str
     region: str
     instance_id: str
 
@@ -374,9 +410,42 @@ def send_escalation_email(subject: str, message: str, recipient: str):
         #     server.starttls()
         #     server.login(sender_email, sender_password)
         #     server.sendmail(sender_email, recipient, msg.as_string())
-        return "Email sent successfully ."+message
+        return "Email sent successfully ." + message
     except Exception as e:
         print(f"Failed to send escalation email: {str(e)}")
+        return "Failed to send escalation email."
+
+
+async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
+    """Validate JWT from Authorization header and return basic user data.
+
+    This is used as a dependency in multiple endpoints to authenticate the user
+    and fetch their Supabase `Users.id`.
+    """
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        email = payload.get("email")
+        if email is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials - email not found",
+            )
+
+        user_response = supabase.table("Users").select("id").eq("email", email).execute()
+        if not user_response.data or len(user_response.data) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
+
+        user_id = user_response.data[0]["id"]
+        return {"email": email, "user_id": user_id}
+    except PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials - invalid token",
+        )
 
 def power_status_tool(Aws: Aws):
     """Executes the power status check and takes action based on the status."""
@@ -597,34 +666,438 @@ def send_mail_to_l2_engineer(command, output, error):
     #     server.login(sender_email, "swiftGMR@123")
     #     server.sendmail(sender_email, receiver_email, msg.as_string())
     return "Email sent to L2 engineer"+command+output+error
+
+
+# --- Knowledge base (Pinecone vector index) helpers ---
+
+PINECONE_KB_INDEX_NAME = os.getenv("PINECONE_KB_INDEX_NAME", "infraai")
+KB_TOP_K_DEFAULT = int(os.getenv("KB_TOP_K_DEFAULT", "5"))
+KB_SCORE_THRESHOLD_DEFAULT = float(os.getenv("KB_SCORE_THRESHOLD_DEFAULT", "0.7"))
+
+# OpenRouter embedding client (OpenAI-compatible embeddings via OpenRouter)
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL")
+OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME")
+
+embedding_client: Optional[OpenAI] = None
+if OPENROUTER_API_KEY:
+    embedding_client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+    )
+
+
+def _get_kb_index():
+    """Return Pinecone index handle for the knowledge base."""
+    try:
+        return pc.Index(PINECONE_KB_INDEX_NAME)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Knowledge base index '{PINECONE_KB_INDEX_NAME}' is not available: {str(e)}",
+        )
+
+
+def _embed_texts(texts: List[str]) -> List[List[float]]:
+    """Embed a list of texts using OpenRouter's OpenAI-compatible embeddings API.
+
+    Uses the `openai/text-embedding-ada-002` model via OpenRouter.
+    """
+    if not texts:
+        return []
+    if embedding_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OpenRouter embedding client is not configured; cannot compute embeddings for knowledge base.",
+        )
+    try:
+        extra_headers: Dict[str, str] = {}
+        if OPENROUTER_SITE_URL:
+            extra_headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+        if OPENROUTER_SITE_NAME:
+            extra_headers["X-Title"] = OPENROUTER_SITE_NAME
+
+        kwargs: Dict[str, Any] = {
+            "model": "openai/text-embedding-ada-002",
+            "input": texts,
+            "encoding_format": "float",
+        }
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+
+        response = embedding_client.embeddings.create(**kwargs)
+        return [item.embedding for item in response.data]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute embeddings via OpenRouter: {str(e)}",
+        )
+
+
+def _chunk_text(text: str, max_chars: int = 1000, overlap: int = 200) -> List[str]:
+    """Simple text splitter that keeps chunks around max_chars, with optional overlap."""
+    text = text or ""
+    if not text.strip():
+        return []
+    chunks: List[str] = []
+    start = 0
+    length = len(text)
+    while start < length:
+        end = min(start + max_chars, length)
+        chunk = text[start:end]
+        chunks.append(chunk.strip())
+        if end == length:
+            break
+        start = max(0, end - overlap)
+    return [c for c in chunks if c]
+
+
+def query_knowledge_base(
+    query: str,
+    top_k: int = KB_TOP_K_DEFAULT,
+    score_threshold: float = KB_SCORE_THRESHOLD_DEFAULT,
+) -> List[dict]:
+    """
+    Query the Pinecone vector knowledge base and return a list of matches.
+
+    Each match has: score, text, source, doc_id, chunk_index.
+    """
+    if not query or not query.strip():
+        return []
+
+    index = _get_kb_index()
+    embedding = _embed_texts([query])[0]
+
+    try:
+        res = index.query(
+            vector=embedding,
+            top_k=top_k,
+            include_metadata=True,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to query knowledge base: {str(e)}",
+        )
+
+    # Handle different possible response shapes
+    matches_raw = []
+    if isinstance(res, dict):
+        matches_raw = res.get("matches", [])
+    elif hasattr(res, "to_dict"):
+        res_dict = res.to_dict()
+        matches_raw = res_dict.get("matches", [])
+    elif hasattr(res, "matches"):
+        matches_raw = res.matches
+
+    matches: List[dict] = []
+    for m in matches_raw or []:
+        if isinstance(m, dict):
+            score = m.get("score")
+            metadata = m.get("metadata") or {}
+        else:
+            score = getattr(m, "score", None)
+            metadata = getattr(m, "metadata", {}) or {}
+
+        if score is None:
+            continue
+        if score_threshold is not None and float(score) < float(score_threshold):
+            continue
+
+        matches.append(
+            {
+                "score": float(score),
+                "text": metadata.get("text", ""),
+                "source": metadata.get("source_file_name") or metadata.get("source") or "",
+                "doc_id": metadata.get("doc_id") or "",
+                "chunk_index": metadata.get("chunk_index"),
+            }
+        )
+
+    return matches
+
+
+def store_document_in_kb(text: str, source_file_name: Optional[str] = None) -> dict:
+    """
+    Split a document into chunks, embed, and store in the Pinecone KB index.
+    Returns a summary including doc_id and number of chunks stored.
+    """
+    index = _get_kb_index()
+    chunks = _chunk_text(text)
+    if not chunks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded document contained no extractable text.",
+        )
+
+    embeddings = _embed_texts(chunks)
+    if len(embeddings) != len(chunks):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Embedding service returned unexpected number of vectors.",
+        )
+
+    doc_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    vectors = []
+    for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        vectors.append(
+            {
+                "id": f"{doc_id}_{idx}",
+                "values": emb,
+                "metadata": {
+                    "text": chunk,
+                    "source_file_name": source_file_name,
+                    "doc_id": doc_id,
+                    "chunk_index": idx,
+                    "created_at": now,
+                },
+            }
+        )
+
+    try:
+        index.upsert(vectors=vectors)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upsert vectors into knowledge base: {str(e)}",
+        )
+
+    return {"doc_id": doc_id, "chunks_indexed": len(vectors)}
+
+
+def _extract_text_from_upload(file: UploadFile) -> str:
+    """
+    Extract plain text from an uploaded file (PDF or text/*).
+    Falls back to UTF-8 decode for unknown types.
+    """
+    contents = file.file.read()
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+
+    text = ""
+    try:
+        if filename.endswith(".pdf") or "pdf" in content_type:
+            try:
+                from pypdf import PdfReader  # type: ignore
+            except ImportError:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="PDF support is not installed. Please add 'pypdf' to requirements.txt.",
+                )
+            import io as _io
+
+            reader = PdfReader(_io.BytesIO(contents))
+            pages_text: List[str] = []
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                pages_text.append(page_text)
+            text = "\n".join(pages_text)
+        elif content_type.startswith("text/") or filename.endswith((".txt", ".md", ".markdown")):
+            text = contents.decode("utf-8", errors="ignore")
+        else:
+            # Best-effort decode for other types
+            text = contents.decode("utf-8", errors="ignore")
+    finally:
+        file.file.close()
+
+    return text or ""
+
+
 @app.post("/addKnowledge")
-def addKnowledge(file: UploadFile = File(...),):
+def addKnowledge(
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+    file: UploadFile = File(...),
+):
+    """Ingest a SOP or other knowledge-base document into the Pinecone vector index.
 
-    with open("Sop.pdf", "wb") as buffer:
-        buffer.write(file.file.read())
-    # Get the assistant.
-    assistant1 = pc.assistant.Assistant(
-    assistant_name="metalaiassistant", 
-    )
+    This endpoint is protected by the same JWT-based auth used elsewhere. The caller
+    must provide a valid `Authorization: Bearer <token>` header, and the token must
+    correspond to an existing user in the `Users` table.
+    """
+    # Authenticate the request (mirror logic from `verify_token` without using it as a
+    # dependency to avoid definition-order issues).
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, key=clerk_public_key, algorithms=["RS256"])
+        email = payload.get("email")
+        if email is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials - email not found",
+            )
+        user_response = supabase.table("Users").select("id").eq("email", email).execute()
+        if not user_response.data or len(user_response.data) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
+        user_id = user_response.data[0]["id"]
+    except PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials - invalid token",
+        )
 
-# Upload a file.
-    response = assistant1.upload_file(
-    file_path="./Sop.pdf",
-    timeout=None
-    )
-    os.remove("Sop.pdf")
-    return{"response": response}
+    # If we reach here, the caller is authenticated and mapped to a valid user.
+    try:
+        raw_text = _extract_text_from_upload(file)
+        if not raw_text.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file contained no readable text.",
+            )
+
+        result = store_document_in_kb(
+            text=raw_text,
+            source_file_name=file.filename,
+        )
+
+        # Best-effort: record document metadata in Supabase for listing/deletion
+        try:
+            supabase.table("KnowledgeBaseDocs").insert({
+                "doc_id": result["doc_id"],
+                "source_file_name": file.filename,
+                "chunks_indexed": result["chunks_indexed"],
+                "user_id": user_id,
+                "email": email,
+                "index_name": PINECONE_KB_INDEX_NAME,
+                "created_at": datetime.utcnow().isoformat(),
+            }).execute()
+        except Exception as meta_err:
+            # Do not fail ingestion if metadata recording fails
+            print(f"Failed to record KnowledgeBaseDocs metadata for doc_id={result['doc_id']}: {str(meta_err)}")
+
+        return {
+            "status": "ok",
+            "doc_id": result["doc_id"],
+            "chunks_indexed": result["chunks_indexed"],
+            "index_name": PINECONE_KB_INDEX_NAME,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to add knowledge: {str(e)}",
+        )
+
 
 @app.get("/getKnowledge")
 def askQuestion(question: str):
-    msg = Message(role='user' ,content=question)
-    assistant1 = pc.assistant.Assistant(
-    assistant_name="metalaiassistant", 
+    """
+    Query the vector-based knowledge base for the given question.
+    Returns concatenated relevant chunks (if any) plus metadata.
+    """
+    matches = query_knowledge_base(question)
+    if not matches:
+        return {
+            "response": "",
+            "matches": [],
+            "has_knowledge": False,
+        }
 
-    )
-    resp = assistant1.chat(messages=[msg])
-    return {"response": resp['message']['content']}
+    combined = "\n\n".join(m["text"] for m in matches if m.get("text"))
+    return {
+        "response": combined,
+        "matches": matches,
+        "has_knowledge": True,
+    }
 
+
+@app.get("/knowledge/docs", response_model=dict)
+async def list_knowledge_documents(user_data: dict = Depends(verify_token)):
+    """List knowledge-base documents ingested via /addKnowledge for the authenticated user.
+
+    Expected Supabase table (must be created separately):
+
+        create table "KnowledgeBaseDocs" (
+            id uuid primary key default gen_random_uuid(),
+            user_id uuid not null references "Users"(id) on delete cascade,
+            email text,
+            doc_id text not null,
+            source_file_name text,
+            chunks_indexed integer,
+            index_name text,
+            created_at timestamptz default now()
+        );
+
+        create index "KnowledgeBaseDocs_user_id_created_at_idx"
+            on "KnowledgeBaseDocs"(user_id, created_at desc);
+    """
+    try:
+        user_id = user_data["user_id"]
+        response = (
+            supabase.table("KnowledgeBaseDocs")
+            .select("id, doc_id, source_file_name, chunks_indexed, index_name, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch knowledge base documents: {str(e)}",
+        )
+
+
+@app.delete("/knowledge/{doc_id}", response_model=dict)
+async def delete_knowledge_document(doc_id: str, user_data: dict = Depends(verify_token)):
+    """Delete a knowledge-base document from Pinecone index and Supabase metadata.
+
+    Only documents owned by the authenticated user (as recorded in KnowledgeBaseDocs)
+    can be deleted.
+    """
+    try:
+        # Ensure the document exists and belongs to this user
+        existing = (
+            supabase.table("KnowledgeBaseDocs")
+            .select("id")
+            .eq("doc_id", doc_id)
+            .eq("user_id", user_data["user_id"])
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Knowledge document not found for this user",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to validate knowledge document: {str(e)}",
+        )
+
+    # Delete vectors from Pinecone (metadata-based delete)
+    index = _get_kb_index()
+    try:
+        index.delete(filter={"doc_id": doc_id})
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete vectors from knowledge base index: {str(e)}",
+        )
+
+    # Delete metadata rows from Supabase
+    try:
+        response = (
+            supabase.table("KnowledgeBaseDocs")
+            .delete()
+            .eq("doc_id", doc_id)
+            .eq("user_id", user_data["user_id"])
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete knowledge document metadata: {str(e)}",
+        )
+
+    return {"status": "ok", "response": response}
 
 
 @app.post("/queueAdd")
@@ -1108,30 +1581,7 @@ def addAwsCredentials(Aws: Aws,credentials: Annotated[HTTPAuthorizationCredentia
     
     
     #json_payload = json.dumps(payload)
-async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
-        email = payload.get("email")
-        if email is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials - email not found",
-            )
-        user_response = supabase.table("Users").select("id").eq("email", email).execute()
-        if not user_response.data or len(user_response.data) == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        user_id = user_response.data[0]["id"]
-        return {"email": email, "user_id": user_id}
-    except PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials - invalid token",
-        )
+
     
 @app.get("/allIncidents")
 
@@ -1309,7 +1759,7 @@ def get_incident_details(incident_number: str,mail:str):
     
     # Send GET request to ServiceNow API with basic authentication
     response = requests.get(
-        query_url, 
+        query_url,
         headers=HEADERS,
         auth=HTTPBasicAuth(username, password)
     )
@@ -1321,12 +1771,65 @@ def get_incident_details(incident_number: str,mail:str):
     else:
         # Return error information if incident not found or request failed
         return {
-            "status": "failed", 
+            "status": "failed",
             "message": f"Incident not found or error occurred: {response.text}"
         }
+
+@tool
+def getfromcmdb(tag_id: str, mail: str):
+    """Fetch CMDB details for a host belonging to the authenticated user.
+
+    The `mail` parameter is injected by the backend and must never be requested from
+    the user. Do not mention this parameter or internal emails in model responses.
+
+    The `tag_id` should match the host's tag identifier stored in the CMDB.
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {
+                "status": "not_found",
+                "message": f"User with email '{mail}' not found.",
+                "items": [],
+            }
+        user_id = user_response.data[0]["id"]
+
+        cmdb_response = (
+            supabase.table("CMDB")
+            .select("*")
+            .eq("tag_id", tag_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        items = cmdb_response.data or []
+
+        if not items:
+            return {
+                "status": "not_found",
+                "message": f"No CMDB entry found for tag_id '{tag_id}' for this user.",
+                "items": [],
+            }
+
+        return {
+            "status": "ok",
+            "items": items,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
 @tool
 def infra_automation_ai(mesaage:str,mail:str):
     '''Automate infrastructure-related tasks for the authenticated user.
+
+    Use this tool whenever the user request or SOP describes infrastructure changes or
+    manual operational steps (for example: "install docker on this EC2 instance",
+    "go to the AWS console and create a VM", or "SSH to the server and run these
+    commands"). The tool converts those instructions into Ansible-based automation
+    and executes them in the user's AWS environment.
 
     The `mail` parameter is the backend-supplied user email identifier used to resolve
     Infisical / AWS / ServiceNow credentials. Never ask the user to provide or confirm
@@ -1460,10 +1963,28 @@ GENERAL BEHAVIOR:
     return {"playbook_output": playbook_output.stdout,"playbook_eror": playbook_output.stderr} 
 
 @tool
-def ask_knowledge_base(message:str):
-    '''this function is used to ask the knowledge base for the given message to provide context '''
-    response = askQuestion(message)
-    return {'response': response['response']}
+def ask_knowledge_base(message: str):
+    '''Query the Pinecone vector knowledge base for the given message and return relevant context.
+
+    The tool will:
+    - search the KB using a semantic vector query
+    - return any matching chunks, or indicate that no knowledge was found
+    '''
+    matches = query_knowledge_base(message)
+    if not matches:
+        return {
+            "has_knowledge": False,
+            "matches": [],
+            "combined_context": "",
+            "message": "No relevant knowledge found in knowledge base.",
+        }
+
+    combined = "\n\n".join(m["text"] for m in matches if m.get("text"))
+    return {
+        "has_knowledge": True,
+        "matches": matches,
+        "combined_context": combined,
+    }
 
 @app.post("/websearch")
 async def web_search(message: str, user_data: dict = Depends(verify_token)):
@@ -1525,39 +2046,133 @@ async def web_search(message: str, user_data: dict = Depends(verify_token)):
             "response": f"Unable to retrieve web search results. Error: {str(e)}. Please try a different query or check your internet connection."
         }
 
-tools = [create_incident, update_incident, get_incident_details,infra_automation_ai]
+tools = [create_incident, update_incident, get_incident_details, getfromcmdb, infra_automation_ai, ask_knowledge_base]
 tool_llm = get_llm()
 llm_with_tools = tool_llm.bind_tools(tools)
 
-tool_mapping = {"create_incident": create_incident, "update_incident": update_incident,"get_incident_details": get_incident_details,"infra_automation_ai": infra_automation_ai}
+tool_mapping = {
+    "create_incident": create_incident,
+    "update_incident": update_incident,
+    "get_incident_details": get_incident_details,
+    "infra_automation_ai": infra_automation_ai,
+    "ask_knowledge_base": ask_knowledge_base,
+}
 
-@app.post("/chat")
-def chat(message:Mesage,credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],response: Response):
+
+def _chat_job_redis_key(job_id: str) -> str:
+    """Build Redis key for storing async chat job state."""
+    return f"chat:job:{job_id}"
+
+
+def _store_chat_history(
+    mail: str,
+    message_content: str,
+    result_text: str,
+    tool_calls: List[Dict[str, Any]],
+    *,
+    is_async: bool = False,
+    job_id: Optional[str] = None,
+) -> None:
+    """Persist a single chat interaction in the Supabase `ChatHistory` table.
+
+    Expected Supabase table schema (must be created separately):
+
+        create table "ChatHistory" (
+            id uuid primary key default gen_random_uuid(),
+            user_id uuid references "Users"(id) on delete cascade,
+            email text,
+            message_content text not null,
+            response_text text,
+            raw_result jsonb,
+            is_async boolean default false,
+            job_id text,
+            created_at timestamptz default now()
+        );
+
+        create index "ChatHistory_user_id_created_at_idx"
+            on "ChatHistory"(user_id, created_at desc);
+    """
     try:
-        token = credentials.credentials
-        res=jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
-        mail=res['email']
-    except jwt.DecodeError as e:
-        print(e)
-        return({"error":e})
+        user_id = None
+        try:
+            user_response = supabase.table("Users").select("id").eq("email", mail).limit(1).execute()
+            if user_response.data:
+                user_id = user_response.data[0]["id"]
+        except Exception as e:
+            # Log but do not break the chat flow if user lookup fails
+            print(f"Chat history: failed to look up user for email {mail}: {str(e)}")
 
+        payload: Dict[str, Any] = {
+            "email": mail,
+            "message_content": message_content,
+            "response_text": result_text,
+            "raw_result": {"tool_calls": tool_calls},
+            "is_async": is_async,
+            "job_id": job_id,
+        }
+        if user_id is not None:
+            payload["user_id"] = user_id
+
+        supabase.table("ChatHistory").insert(payload).execute()
+    except Exception as e:
+        # Chat should not fail just because history persistence failed
+        print(f"Chat history: failed to insert record: {str(e)}")
+
+
+def process_chat_request(
+    mail: str,
+    message_content: str,
+    *,
+    is_async: bool = False,
+    job_id: Optional[str] = None,
+) -> dict:
+    """Core chat logic shared by sync and async endpoints.
+
+    This function lets the LLM decide which tools to call and in what order
+    (e.g., call ask_knowledge_base first, then infra_automation_ai), by
+    iteratively executing tool calls until the model returns a final answer
+    with no further tool invocations.
+
+    It also persists each interaction in the `ChatHistory` Supabase table.
+    """
     system_message = SystemMessage(content=CHAT_SYSTEM_PROMPT)
-    messages=[system_message, HumanMessage(content=message.content)]
-    res=llm_with_tools.invoke(messages)
-    messages.append(res)
-    for tool_call in res.tool_calls:
-        tool_name = tool_call["name"].lower()
-        tool = tool_mapping[tool_name]
-        tool_args = dict(tool_call["args"]) if isinstance(tool_call["args"], dict) else {}
-        # Inject backend-managed email for tools that require `mail`
-        if tool_name in {"create_incident", "update_incident", "get_incident_details", "infra_automation_ai"}:
-            tool_args["mail"] = mail
-        tool_output = tool.invoke(tool_args)
-        messages.append(ToolMessage(tool_output, tool_call_id=tool_call["id"]))
-    
-    ex2=llm_with_tools.invoke(messages)
+    messages = [system_message, HumanMessage(content=message_content)]
+
+    all_tool_calls: List[Dict[str, Any]] = []
+    final_model_message: Optional[Any] = None
+
+    # Allow the model multiple rounds of tool usage (e.g. KB first, then infra_automation_ai)
+    for _ in range(5):  # safety limit to avoid infinite loops
+        res = llm_with_tools.invoke(messages)
+        final_model_message = res
+        messages.append(res)
+
+        tool_calls = getattr(res, "tool_calls", []) or []
+        if not tool_calls:
+            break
+
+        for tool_call in tool_calls:
+            tool_name = tool_call["name"].lower()
+            tool = tool_mapping[tool_name]
+            tool_args = dict(tool_call["args"]) if isinstance(tool_call["args"], dict) else {}
+
+            # Inject backend-managed email for tools that require `mail`
+            if tool_name in {"create_incident", "update_incident", "get_incident_details", "infra_automation_ai", "getfromcmdb"}:
+                tool_args["mail"] = mail
+
+            tool_output = tool.invoke(tool_args)
+            all_tool_calls.append({
+                "name": tool_name,
+                "args": tool_args,
+                "output": tool_output,
+            })
+
+            messages.append(ToolMessage(tool_output, tool_call_id=tool_call["id"]))
+
+    # Use a separate summarization call for the final natural-language answer
+    ex2 = final_model_message if final_model_message is not None else ""
     result_text = call_llm(
-        f'''generate a response for the given context {ex2} make it short and give only important details related to {message} in sentences dont add unnecessary , or symbols or extra spaces use the {ex2} to provide details and if it failed give details why it failed
+        f'''generate a response for the given context {ex2} make it short and give only important details related to {message_content} in sentences dont add unnecessary , or symbols or extra spaces use the {ex2} to provide details and if it failed give details why it failed
                                    - dont mention the word playbook and word shell commands and word python error  and dont mention this sentence
                                    - A warning was generated regarding the Python interpreter path potentially changing in the future. Galaxy collections installation indicated that all requested collections are already installed. No shell errors were reported and
                                    - dont mention automation or any such word
@@ -1567,34 +2182,243 @@ def chat(message:Mesage,credentials: Annotated[HTTPAuthorizationCredentials, Dep
     )
 
     # Extract incident number from the message if it exists
-    incident_match = re.search(r'incident\s+(\w+)', message.content, re.IGNORECASE)
+    incident_match = re.search(r'incident\s+(\w+)', message_content, re.IGNORECASE)
     if incident_match:
         inc_number = incident_match.group(1)
         try:
-            # Check if incident exists in Supabase
             incident_response = supabase.table("Incidents").select("id").eq("inc_number", inc_number).execute()
-            
             if incident_response.data:
-                # Update incident status to completed
                 supabase.table("Incidents").update({"state": "completed"}).eq("inc_number", inc_number).execute()
         except Exception as e:
             print(f"Error updating incident status: {str(e)}")
             # Continue with the response even if update fails
-        
-    return({"result":res.tool_calls,"successorfail":result_text})
+
+    # Persist chat history (best-effort, non-blocking on failure)
+    _store_chat_history(
+        mail=mail,
+        message_content=message_content,
+        result_text=result_text,
+        tool_calls=all_tool_calls,
+        is_async=is_async,
+        job_id=job_id,
+    )
+
+    return {"result": all_tool_calls, "successorfail": result_text}
+
+
+@app.post("/chat")
+def chat(message: Mesage, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)], response: Response):
+    """
+    Synchronous chat endpoint (existing behavior), now delegating to shared chat logic.
+    """
+    try:
+        token = credentials.credentials
+        res = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        mail = res['email']
+    except jwt.DecodeError as e:
+        print(e)
+        return {"error": e}
+
+    return process_chat_request(mail=mail, message_content=message.content)
+
+
+@app.post("/chat/async")
+def enqueue_chat(
+    message: Mesage,
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+):
+    """
+    Asynchronous chat endpoint.
+    Enqueues the chat request into SQS (Chatqueue) and immediately returns a job_id.
+    The client should poll /chat/async/{job_id} to retrieve the result from Redis.
+    """
+    try:
+        token = credentials.credentials
+        res = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        mail = res['email']
+    except jwt.DecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials - invalid token",
+        )
+
+    job_id = str(uuid.uuid4())
+    body = {
+        "job_id": job_id,
+        "mail": mail,
+        "content": message.content,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    message_body = json.dumps(body)
+    content_hash = hashlib.sha256(message_body.encode()).hexdigest()
+    dedup_id = f"{content_hash}-{job_id}"
+
+    try:
+        sqsqueue = session.resource('sqs').get_queue_by_name(QueueName=CHAT_QUEUE_NAME)
+        sqsqueue.send_message(
+            MessageBody=message_body,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to enqueue chat request: {str(e)}",
+        )
+
+    # Initialize job state in Redis
+    job_key = _chat_job_redis_key(job_id)
+    r.set(job_key, json.dumps({"status": "queued"}), ex=CHAT_JOB_TTL_SECONDS)
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/chat/async/{job_id}")
+def get_chat_job_status(job_id: str):
+    """
+    Polling endpoint for async chat jobs.
+    Returns current status and, when completed, the chat result.
+    """
+    job_key = _chat_job_redis_key(job_id)
+    raw = r.get(job_key)
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found or has expired",
+        )
+    data = json.loads(raw)
+    data["job_id"] = job_id
+    return data
+
+
+@app.get("/chat/history", response_model=dict)
+async def get_chat_history(
+    limit: int = 50,
+    offset: int = 0,
+    user_data: dict = Depends(verify_token),
+):
+    """Return chat history for the authenticated user, newest first.
+
+    Records are read from the `ChatHistory` Supabase table that `_store_chat_history` writes to.
+    """
+    try:
+        # Basic safety bounds for pagination
+        if limit < 1:
+            limit = 1
+        if limit > 200:
+            limit = 200
+
+        user_id = user_data["user_id"]
+        start = offset
+        end = offset + limit - 1
+
+        response = (
+            supabase.table("ChatHistory")
+            .select("id, email, message_content, response_text, is_async, job_id, created_at, raw_result")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .range(start, end)
+            .execute()
+        )
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch chat history: {str(e)}",
+        )
+
+
+def chat_worker_loop():
+    """
+    Background worker that consumes chat jobs from SQS Chatqueue
+    and stores results in Redis keyed by job_id.
+    """
+    try:
+        sqs = session.resource('sqs')
+        queue = sqs.get_queue_by_name(QueueName=CHAT_QUEUE_NAME)
+    except Exception as e:
+        print(f"Chat worker failed to initialize SQS queue {CHAT_QUEUE_NAME}: {e}")
+        return
+
+    while True:
+        try:
+            messages = queue.receive_messages(
+                MessageAttributeNames=['All'],
+                MaxNumberOfMessages=1,
+                WaitTimeSeconds=20,
+            )
+            if not messages:
+                continue
+
+            for message in messages:
+                job_id = None
+                try:
+                    body = json.loads(message.body)
+                    job_id = body.get("job_id")
+                    mail = body.get("mail")
+                    content = body.get("content", "")
+
+                    if not job_id or not mail or not content:
+                        # Malformed message; drop it
+                        message.delete()
+                        continue
+
+                    job_key = _chat_job_redis_key(job_id)
+                    r.set(job_key, json.dumps({"status": "processing"}), ex=CHAT_JOB_TTL_SECONDS)
+
+                    result = process_chat_request(
+                        mail=mail,
+                        message_content=content,
+                        is_async=True,
+                        job_id=job_id,
+                    )
+
+                    r.set(
+                        job_key,
+                        json.dumps({"status": "completed", "result": result}),
+                        ex=CHAT_JOB_TTL_SECONDS,
+                    )
+
+                    message.delete()
+                except Exception as e:
+                    print(f"Error processing chat job from SQS: {e}")
+                    if job_id:
+                        job_key = _chat_job_redis_key(job_id)
+                        r.set(
+                            job_key,
+                            json.dumps({"status": "error", "error": str(e)}),
+                            ex=CHAT_JOB_TTL_SECONDS,
+                        )
+                    # Always delete the message so it is not retried on failure
+                    try:
+                        message.delete()
+                    except Exception as delete_err:
+                        print(f"Failed to delete SQS message after error: {delete_err}")
+        except Exception as outer_e:
+            print(f"Chat worker loop error: {outer_e}")
+            time.sleep(5)
 
 @app.post("/plan")
-def getPlan(message: Mesage,user_data: dict = Depends(verify_token)):
+def getPlan(message: Mesage, user_data: dict = Depends(verify_token)):
     llm = get_llm()
 
-   
+    # Try to enrich the plan with internal KB context first; if anything fails,
+    # we silently fall back to the previous behavior.
+    try:
+        kb_matches = query_knowledge_base(message.content)
+    except Exception:
+        kb_matches = []
 
-# 🧾 JSON parser
+    kb_context = ""
+    if kb_matches:
+        kb_context = "Relevant internal knowledge base entries:\n" + "\n\n".join(
+            m["text"] for m in kb_matches if m.get("text")
+        )
+
+    # 🧾 JSON parser
     parser = JsonOutputParser()
 
-# 🧱 Prompt template
+    # 🧱 Prompt template
     prompt = ChatPromptTemplate.from_messages([
-    ("system", """
+        ("system", """
 You are an assistant that extracts infrastructure change plans from user input. Given a user message, return a JSON object with the key "plan" and the value as a list of bullet points. Each bullet point should describe a specific action to be taken, including:
 - The action (created, updated, deleted)
 - The type of resource
@@ -1624,25 +2448,26 @@ Example format:
 
 Output only the JSON object. Do not add any extra text, markdown, or newlines before or after. Your response must start with '{{' and end with '}}' with no characters outside. Do not include markdown.
 """),
-    ("user", "{user_input}\n{format_instructions}")
-])
+        ("user", "{user_input}\n\n{kb_context}\n\n{format_instructions}")
+    ])
 
-# 🔗 Chain
+    # 🔗 Chain
     chain: Runnable = prompt | llm | parser
 
-# 🚀 Function to run inference
+    # 🚀 Function to run inference
 
     try:
         result = chain.invoke({
             "user_input": f"The user's request is: {message.content}",
-            "format_instructions": parser.get_format_instructions()
+            "kb_context": kb_context,
+            "format_instructions": parser.get_format_instructions(),
         })
         return {"response": result}
-        
+
     except Exception as e:
         return {
             "error": "Failed to parse JSON",
-            "message": str(e)
+            "message": str(e),
         }
 @app.get("/cmdb", response_model=dict)
 async def get_all_cmdb_items(user_data: dict = Depends(verify_token)):
@@ -1950,6 +2775,76 @@ async def update_servicenow_credentials(snow: Snow_key, credentials: Annotated[H
             detail=f"Failed to update ServiceNow credentials: {str(e)}"
         )
 
+
+@app.post("/prometheus/config")
+async def add_or_update_prometheus_config(
+    cfg: PrometheusConfig,
+    user_data: dict = Depends(verify_token),
+):
+    """Store or update Prometheus datasource configuration for the authenticated user.
+
+    Expected Supabase table (must be created separately):
+
+        create table "PrometheusConfigs" (
+            id uuid primary key default gen_random_uuid(),
+            user_id uuid not null references "Users"(id) on delete cascade,
+            name text,
+            base_url text not null,
+            auth_type text default 'none',
+            bearer_token text,
+            created_at timestamptz default now(),
+            updated_at timestamptz default now()
+        );
+    """
+    try:
+        user_id = user_data["user_id"]
+        now = datetime.utcnow().isoformat()
+
+        existing = supabase.table("PrometheusConfigs").select("id").eq("user_id", user_id).execute()
+        if existing.data:
+            config_id = existing.data[0]["id"]
+            response = supabase.table("PrometheusConfigs").update({
+                "name": cfg.name,
+                "base_url": cfg.base_url,
+                "auth_type": cfg.auth_type,
+                "bearer_token": cfg.bearer_token,
+                "updated_at": now,
+            }).eq("id", config_id).execute()
+        else:
+            response = supabase.table("PrometheusConfigs").insert({
+                "user_id": user_id,
+                "name": cfg.name,
+                "base_url": cfg.base_url,
+                "auth_type": cfg.auth_type,
+                "bearer_token": cfg.bearer_token,
+                "created_at": now,
+                "updated_at": now,
+            }).execute()
+
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to store Prometheus configuration: {str(e)}",
+        )
+
+
+@app.get("/prometheus/config")
+async def get_prometheus_config(user_data: dict = Depends(verify_token)):
+    """Return Prometheus datasource configuration for the authenticated user (if any)."""
+    try:
+        user_id = user_data["user_id"]
+        response = supabase.table("PrometheusConfigs").select("*").eq("user_id", user_id).limit(1).execute()
+        if not response.data:
+            return {"response": None}
+        # Return only the first config for this user
+        return {"response": response.data[0]}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch Prometheus configuration: {str(e)}",
+        )
+ 
 @app.post("/storeResult")
 async def store_result(inc_number: str, result: str, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
     try:

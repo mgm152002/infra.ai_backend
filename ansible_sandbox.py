@@ -77,6 +77,7 @@ ecs.register_task_definition(
             "entryPoint": ["/bin/sh", "-c"],
            "command": [
   "aws s3 cp s3://{}/ansible-runtime/ . --recursive && "
+  "chmod 600 key.pem && "
   "chmod +x install_ansible_modules.sh playbook_command.sh && "
   "./install_ansible_modules.sh && "
   "./playbook_command.sh && "

@@ -3,6 +3,7 @@ pydantic
 google-generativeai
 requests
 beautifulsoup4
+pypdf
 pinecone
 pinecone-plugins-assistant
 boto3

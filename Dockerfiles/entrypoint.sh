@@ -7,6 +7,9 @@ BUCKET=${BUCKET:-"my-ansible-runtime-bucket"}
 # Download runtime files from S3
 aws s3 cp s3://${BUCKET}/ansible-runtime/ . --recursive
 
+# Ensure SSH private key has strict permissions (required by ssh/Ansible)
+chmod 600 key.pem
+ 
 # Make scripts executable
 chmod +x install_ansible_modules.sh playbook_command.sh
 
