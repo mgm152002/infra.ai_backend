@@ -55,6 +55,33 @@ from typing import AsyncGenerator
 
 from worker import worker_loop
 
+# --- External integrations (shared by API + chat tools) ---
+from integrations.github import (
+    get_github_config,
+    set_github_config,
+    github_search_issues as github_search_issues_impl,
+    github_get_issue as github_get_issue_impl,
+)
+from integrations.jira import (
+    get_jira_config,
+    set_jira_config,
+    jira_search_issues as jira_search_issues_impl,
+    jira_get_issue as jira_get_issue_impl,
+)
+from integrations.confluence import (
+    get_confluence_config,
+    set_confluence_config,
+    confluence_search_pages as confluence_search_pages_impl,
+    confluence_get_page as confluence_get_page_impl,
+)
+from integrations.pagerduty import (
+    get_pagerduty_config,
+    set_pagerduty_config,
+    pagerduty_list_incidents as pagerduty_list_incidents_impl,
+    pagerduty_get_incident as pagerduty_get_incident_impl,
+)
+from integrations.prometheus import prometheus_instant_query
+
 async def worker_lifespan(app: FastAPI):
     """Start multiple worker threads when application starts"""
     import threading
@@ -325,6 +352,31 @@ class PrometheusConfig(BaseModel):
     bearer_token: Optional[str] = None
 
 
+class GitHubIntegrationConfig(BaseModel):
+    base_url: Optional[str] = None
+    token: Optional[str] = None
+    default_owner: Optional[str] = None
+    default_repo: Optional[str] = None
+
+
+class JiraIntegrationConfig(BaseModel):
+    base_url: str
+    email: Optional[str] = None
+    api_token: str
+
+
+class ConfluenceIntegrationConfig(BaseModel):
+    base_url: str
+    email: Optional[str] = None
+    api_token: str
+
+
+class PagerDutyIntegrationConfig(BaseModel):
+    api_token: str
+    service_ids: Optional[str] = None  # comma-separated
+    team_ids: Optional[str] = None  # comma-separated
+
+
 class Aws(BaseModel):
     access_key: str
     secrete_access: str
@@ -341,11 +393,32 @@ class RequestBody(BaseModel):
     Mail: IncidentMail  
     
 class Incident(BaseModel):
-    id: Union[int,None]
+    # NOTE: This model is used by /incidentAdd.
+    # Keep fields backward-compatible with existing UI flows, while adding
+    # optional external-* fields to support PagerDuty (and other sources).
+    id: Optional[Union[int, str]] = None
+
+    # Core (existing)
     short_description: str
-    tag_id: str
-    state: Union[str, None]
-    inc_number: Union[str, None]
+    tag_id: Optional[str] = None
+    state: Optional[str] = None
+
+    # Internal incident correlation key used by worker + Results table.
+    # For PagerDuty you can pass this explicitly, or let /incidentAdd derive it.
+    inc_number: Optional[str] = None
+
+    # External linkage (PagerDuty / ServiceNow / etc.)
+    # Recommended values: 'manual' | 'servicenow' | 'pagerduty'
+    source: Optional[str] = None
+    external_id: Optional[str] = None
+    external_number: Optional[str] = None
+    external_url: Optional[str] = None
+    external_status: Optional[str] = None
+    external_urgency: Optional[str] = None
+    external_service: Optional[str] = None
+    external_created_at: Optional[datetime] = None
+    external_updated_at: Optional[datetime] = None
+    external_payload: Optional[Dict[str, Any]] = None
 
 class Mesage(BaseModel):
     content: str
@@ -1986,6 +2059,92 @@ def ask_knowledge_base(message: str):
         "combined_context": combined,
     }
 
+
+# --- Additional chat tools: Prometheus + GitHub + Jira + Confluence + PagerDuty ---
+
+@tool
+def prometheus_query(query: str, mail: str):
+    """Query Prometheus using the authenticated user's saved datasource.
+
+    Use this to fetch live metrics to support incident diagnosis.
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).limit(1).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+
+        cfg_resp = supabase.table("PrometheusConfigs").select("*").eq("user_id", user_id).limit(1).execute()
+        if not cfg_resp.data:
+            return {"status": "not_configured", "message": "Prometheus datasource is not configured"}
+
+        cfg = cfg_resp.data[0]
+        return prometheus_instant_query(
+            base_url=cfg.get("base_url"),
+            query=query,
+            auth_type=cfg.get("auth_type") or "none",
+            bearer_token=cfg.get("bearer_token"),
+        )
+    except Exception as e:
+        return {"status": "error", "message": f"Prometheus query failed: {str(e)}"}
+
+
+@tool
+def github_search_issues(query: str, owner: Optional[str] = None, repo: Optional[str] = None, max_results: int = 10, mail: str = ""):
+    """Search GitHub issues and pull requests (uses the user's configured GitHub token).
+
+    Prefer giving a repo context via owner/repo, or configure default_owner/default_repo in credentials.
+    """
+    return github_search_issues_impl(mail=mail, query=query, owner=owner, repo=repo, max_results=max_results)
+
+
+@tool
+def github_get_issue(owner: str, repo: str, number: int, mail: str = ""):
+    """Get a specific GitHub issue/PR by number."""
+    return github_get_issue_impl(mail=mail, owner=owner, repo=repo, number=number)
+
+
+@tool
+def jira_search_issues(jql: str, max_results: int = 10, mail: str = ""):
+    """Search Jira issues using JQL (Jira Cloud REST API v3)."""
+    return jira_search_issues_impl(mail=mail, jql=jql, max_results=max_results)
+
+
+@tool
+def jira_get_issue(issue_key: str, mail: str = ""):
+    """Get a Jira issue by key (e.g. PROJ-123)."""
+    return jira_get_issue_impl(mail=mail, issue_key=issue_key)
+
+
+@tool
+def confluence_search_pages(cql: str, limit: int = 10, mail: str = ""):
+    """Search Confluence content using CQL (Confluence REST API)."""
+    return confluence_search_pages_impl(mail=mail, cql=cql, limit=limit)
+
+
+@tool
+def confluence_get_page(page_id: str, mail: str = ""):
+    """Get a Confluence page by content id."""
+    return confluence_get_page_as_json(mail=mail, page_id=page_id)
+
+
+def confluence_get_page_as_json(*, mail: str, page_id: str) -> dict:
+    # Wrapper so the tool function signature stays simple.
+    return confluence_get_page_impl(mail=mail, page_id=page_id)
+
+
+@tool
+def pagerduty_list_incidents(statuses: Optional[List[str]] = None, limit: int = 25, mail: str = ""):
+    """List PagerDuty incidents for the authenticated user."""
+    return pagerduty_list_incidents_impl(mail=mail, statuses=statuses, limit=limit)
+
+
+@tool
+def pagerduty_get_incident(incident_id: str, mail: str = ""):
+    """Get a PagerDuty incident by id."""
+    return pagerduty_get_incident_impl(mail=mail, incident_id=incident_id)
+
+
 @app.post("/websearch")
 async def web_search(message: str, user_data: dict = Depends(verify_token)):
     '''this function is used to search the web for the given message'''
@@ -2046,16 +2205,47 @@ async def web_search(message: str, user_data: dict = Depends(verify_token)):
             "response": f"Unable to retrieve web search results. Error: {str(e)}. Please try a different query or check your internet connection."
         }
 
-tools = [create_incident, update_incident, get_incident_details, getfromcmdb, infra_automation_ai, ask_knowledge_base]
+tools = [
+    # Keep KB tool first so the model sees it prominently
+    ask_knowledge_base,
+    create_incident,
+    update_incident,
+    get_incident_details,
+    getfromcmdb,
+    infra_automation_ai,
+    prometheus_query,
+    github_search_issues,
+    github_get_issue,
+    jira_search_issues,
+    jira_get_issue,
+    confluence_search_pages,
+    confluence_get_page,
+    pagerduty_list_incidents,
+    pagerduty_get_incident,
+]
+
 tool_llm = get_llm()
 llm_with_tools = tool_llm.bind_tools(tools)
 
-tool_mapping = {
-    "create_incident": create_incident,
-    "update_incident": update_incident,
-    "get_incident_details": get_incident_details,
-    "infra_automation_ai": infra_automation_ai,
-    "ask_knowledge_base": ask_knowledge_base,
+# Lookup for tool execution
+tool_mapping = {t.name.lower(): t for t in tools}
+
+# Tool names that require backend-injected `mail`
+TOOLS_REQUIRING_MAIL = {
+    "create_incident",
+    "update_incident",
+    "get_incident_details",
+    "getfromcmdb",
+    "infra_automation_ai",
+    "prometheus_query",
+    "github_search_issues",
+    "github_get_issue",
+    "jira_search_issues",
+    "jira_get_issue",
+    "confluence_search_pages",
+    "confluence_get_page",
+    "pagerduty_list_incidents",
+    "pagerduty_get_incident",
 }
 
 
@@ -2152,22 +2342,27 @@ def process_chat_request(
             break
 
         for tool_call in tool_calls:
-            tool_name = tool_call["name"].lower()
-            tool = tool_mapping[tool_name]
-            tool_args = dict(tool_call["args"]) if isinstance(tool_call["args"], dict) else {}
+            tool_name = (tool_call.get("name") or "").lower()
+            tool = tool_mapping.get(tool_name)
+            tool_args = dict(tool_call.get("args") or {}) if isinstance(tool_call.get("args"), dict) else {}
 
             # Inject backend-managed email for tools that require `mail`
-            if tool_name in {"create_incident", "update_incident", "get_incident_details", "infra_automation_ai", "getfromcmdb"}:
+            if tool_name in TOOLS_REQUIRING_MAIL:
                 tool_args["mail"] = mail
 
-            tool_output = tool.invoke(tool_args)
+            if tool is None:
+                tool_output: Any = {"status": "error", "message": f"Unknown tool: {tool_name}"}
+            else:
+                tool_output = tool.invoke(tool_args)
+
             all_tool_calls.append({
                 "name": tool_name,
                 "args": tool_args,
                 "output": tool_output,
             })
 
-            messages.append(ToolMessage(tool_output, tool_call_id=tool_call["id"]))
+            tool_output_str = tool_output if isinstance(tool_output, str) else json.dumps(tool_output)
+            messages.append(ToolMessage(content=tool_output_str, tool_call_id=tool_call["id"]))
 
     # Use a separate summarization call for the final natural-language answer
     ex2 = final_model_message if final_model_message is not None else ""
@@ -2776,6 +2971,211 @@ async def update_servicenow_credentials(snow: Snow_key, credentials: Annotated[H
         )
 
 
+def _split_csv(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+# --- Integrations: GitHub / Jira / Confluence / PagerDuty ---
+
+@app.get("/integrations/github/config")
+async def get_github_integration_config(user_data: dict = Depends(verify_token)):
+    return {"response": get_github_config(user_data["email"])}
+
+
+@app.post("/integrations/github/config")
+async def save_github_integration_config(cfg: GitHubIntegrationConfig, user_data: dict = Depends(verify_token)):
+    set_github_config(
+        user_data["email"],
+        token=cfg.token,
+        base_url=cfg.base_url,
+        default_owner=cfg.default_owner,
+        default_repo=cfg.default_repo,
+    )
+    return {"status": "ok"}
+
+
+@app.get("/integrations/github/issues/search")
+async def github_issues_search(
+    query: str,
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    max_results: int = 10,
+    user_data: dict = Depends(verify_token),
+):
+    return {
+        "response": github_search_issues_impl(
+            mail=user_data["email"],
+            query=query,
+            owner=owner,
+            repo=repo,
+            max_results=max_results,
+        )
+    }
+
+
+@app.get("/integrations/github/issues/{owner}/{repo}/{number}")
+async def github_issue_get(
+    owner: str,
+    repo: str,
+    number: int,
+    user_data: dict = Depends(verify_token),
+):
+    return {
+        "response": github_get_issue_impl(
+            mail=user_data["email"],
+            owner=owner,
+            repo=repo,
+            number=number,
+        )
+    }
+
+
+@app.get("/integrations/jira/config")
+async def get_jira_integration_config(user_data: dict = Depends(verify_token)):
+    return {"response": get_jira_config(user_data["email"])}
+
+
+@app.post("/integrations/jira/config")
+async def save_jira_integration_config(cfg: JiraIntegrationConfig, user_data: dict = Depends(verify_token)):
+    set_jira_config(
+        user_data["email"],
+        base_url=cfg.base_url,
+        email=cfg.email,
+        api_token=cfg.api_token,
+    )
+    return {"status": "ok"}
+
+
+@app.get("/integrations/jira/issues/search")
+async def jira_issues_search(
+    jql: str,
+    fields: Optional[str] = None,
+    max_results: int = 10,
+    user_data: dict = Depends(verify_token),
+):
+    return {
+        "response": jira_search_issues_impl(
+            mail=user_data["email"],
+            jql=jql,
+            fields=_split_csv(fields) if fields else None,
+            max_results=max_results,
+        )
+    }
+
+
+@app.get("/integrations/jira/issues/{issue_key}")
+async def jira_issue_get(
+    issue_key: str,
+    fields: Optional[str] = None,
+    user_data: dict = Depends(verify_token),
+):
+    return {
+        "response": jira_get_issue_impl(
+            mail=user_data["email"],
+            issue_key=issue_key,
+            fields=_split_csv(fields) if fields else None,
+        )
+    }
+
+
+@app.get("/integrations/confluence/config")
+async def get_confluence_integration_config(user_data: dict = Depends(verify_token)):
+    return {"response": get_confluence_config(user_data["email"])}
+
+
+@app.post("/integrations/confluence/config")
+async def save_confluence_integration_config(cfg: ConfluenceIntegrationConfig, user_data: dict = Depends(verify_token)):
+    set_confluence_config(
+        user_data["email"],
+        base_url=cfg.base_url,
+        email=cfg.email,
+        api_token=cfg.api_token,
+    )
+    return {"status": "ok"}
+
+
+@app.get("/integrations/confluence/pages/search")
+async def confluence_pages_search(
+    cql: str,
+    limit: int = 10,
+    user_data: dict = Depends(verify_token),
+):
+    return {"response": confluence_search_pages_impl(mail=user_data["email"], cql=cql, limit=limit)}
+
+
+@app.get("/integrations/confluence/pages/{page_id}")
+async def confluence_page_get(
+    page_id: str,
+    user_data: dict = Depends(verify_token),
+):
+    return {"response": confluence_get_page_impl(mail=user_data["email"], page_id=page_id)}
+
+
+@app.get("/integrations/pagerduty/config")
+async def get_pagerduty_integration_config(user_data: dict = Depends(verify_token)):
+    return {"response": get_pagerduty_config(user_data["email"])}
+
+
+@app.post("/integrations/pagerduty/config")
+async def save_pagerduty_integration_config(cfg: PagerDutyIntegrationConfig, user_data: dict = Depends(verify_token)):
+    set_pagerduty_config(
+        user_data["email"],
+        api_token=cfg.api_token,
+        service_ids=cfg.service_ids,
+        team_ids=cfg.team_ids,
+    )
+    return {"status": "ok"}
+
+
+@app.get("/integrations/pagerduty/incidents")
+async def pagerduty_incidents(
+    statuses: Optional[str] = None,
+    limit: int = 25,
+    user_data: dict = Depends(verify_token),
+):
+    return {
+        "response": pagerduty_list_incidents_impl(
+            mail=user_data["email"],
+            statuses=_split_csv(statuses) if statuses else None,
+            limit=limit,
+        )
+    }
+
+
+@app.get("/integrations/pagerduty/incidents/{incident_id}")
+async def pagerduty_incident_get(
+    incident_id: str,
+    user_data: dict = Depends(verify_token),
+):
+    return {"response": pagerduty_get_incident_impl(mail=user_data["email"], incident_id=incident_id)}
+
+
+@app.get("/integrations/prometheus/query")
+async def prometheus_query_endpoint(
+    query: str,
+    user_data: dict = Depends(verify_token),
+):
+    user_id = user_data.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    resp = supabase.table("PrometheusConfigs").select("*").eq("user_id", user_id).limit(1).execute()
+    if not resp.data:
+        return {"response": {"status": "not_configured", "message": "Prometheus datasource is not configured"}}
+
+    cfg = resp.data[0]
+    return {
+        "response": prometheus_instant_query(
+            base_url=cfg.get("base_url"),
+            query=query,
+            auth_type=cfg.get("auth_type") or "none",
+            bearer_token=cfg.get("bearer_token"),
+        )
+    }
+
+
 @app.post("/prometheus/config")
 async def add_or_update_prometheus_config(
     cfg: PrometheusConfig,
@@ -2911,52 +3311,105 @@ async def get_results(inc_number: str, credentials: Annotated[HTTPAuthorizationC
         )
 
 @app.post("/incidentAdd")
-def incidentAdd(Req:Incident, user_data: dict = Depends(verify_token)):
+def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
     # Get user_id from verified token
-    user_id = user_data.get('user_id')
-    
+    user_id = user_data.get("user_id")
+
+    # Derive internal inc_number if missing (especially useful for PagerDuty imports)
+    inc_number = (Req.inc_number or "").strip() if Req.inc_number is not None else ""
+
+    # Normalise and clamp source to allowed DB values to avoid incidents_source_check failures.
+    # If the source is missing or not one of the recognised values, we let the DB
+    # default apply ("manual"). This also converts things like "MANUAL" safely.
+    allowed_sources = {"manual", "servicenow", "pagerduty"}
+    raw_source = (Req.source or "").strip().lower() if Req.source else ""
+    source = raw_source if raw_source in allowed_sources else None
+
+    if not inc_number:
+        if source == "pagerduty":
+            if Req.external_id:
+                inc_number = f"PD-{Req.external_id}".strip()
+            elif Req.external_number:
+                inc_number = f"PD-{Req.external_number}".strip()
+        if not inc_number:
+            inc_number = f"INC-{uuid.uuid4().hex[:12].upper()}"
+
+    state = Req.state or "Queued"
+    tag_id = Req.tag_id
+
+    external_created_at = Req.external_created_at.isoformat() if Req.external_created_at else None
+    external_updated_at = Req.external_updated_at.isoformat() if Req.external_updated_at else None
+
+    # Treat empty / missing payloads as NULL so simple incidents don't store traces by default.
+    external_payload = Req.external_payload or None
+
+    insert_payload: Dict[str, Any] = {
+        "id": Req.id,
+        "short_description": Req.short_description,
+        "tag_id": tag_id,
+        "state": state,
+        "inc_number": inc_number,
+        "user_id": user_id,
+        "source": source,
+        "external_id": Req.external_id,
+        "external_number": Req.external_number,
+        "external_url": Req.external_url,
+        "external_status": Req.external_status,
+        "external_urgency": Req.external_urgency,
+        "external_service": Req.external_service,
+        "external_created_at": external_created_at,
+        "external_updated_at": external_updated_at,
+        "external_payload": external_payload,
+    }
+
+    # Avoid inserting NULLs (lets DB defaults apply where present)
+    insert_payload = {k: v for k, v in insert_payload.items() if v is not None}
+
     # Insert incident with user_id
-    response = (
-    supabase.table("Incidents")
-    .insert({
-        "id": Req.id, 
-        "short_description": Req.short_description, 
-        "tag_id": Req.tag_id, 
-        "state": Req.state, 
-        "inc_number": Req.inc_number,
-        "user_id": user_id  # Add user_id to the incident
-    })
-    .execute()
-    )
-    
-    # Get instance_id
-    instance_id = supabase.table("Incidents").select("tag_id").eq("id", Req.id).execute()
-    
+    supabase.table("Incidents").insert(insert_payload).execute()
+
     # Prepare SQS queue message
-    sqsqueue = session.resource('sqs').get_queue_by_name(QueueName='infraaiqueue.fifo')
-    message_body = json.dumps({
-        "Aws": {
-            "access_key": "",  # Will be retrieved by worker from user's stored credentials
-            "secrete_access": "",
-            "region": "",
-            "instance_id": Req.tag_id  # Using tag_id as instance_id for now
-        },
-        "Mail": {
-            "inc_number": Req.inc_number,
-            "subject": Req.short_description,
-            "message": f"Incident {Req.inc_number}: {Req.short_description}"
-        },
-        "Meta": {
-            "user_id": user_id,
-            "tag_id": Req.tag_id
+    sqsqueue = session.resource("sqs").get_queue_by_name(QueueName="infraaiqueue.fifo")
+
+    # Worker requires Mail.inc_number/subject/message
+    message_parts = [f"Incident {inc_number}: {Req.short_description}"]
+    if source:
+        message_parts.append(f"source={source}")
+    if Req.external_status:
+        message_parts.append(f"status={Req.external_status}")
+    if Req.external_service:
+        message_parts.append(f"service={Req.external_service}")
+    if Req.external_url:
+        message_parts.append(f"url={Req.external_url}")
+    message_text = " | ".join(message_parts)
+
+    message_body = json.dumps(
+        {
+            "Aws": {
+                "access_key": "",  # Will be retrieved by worker from user's stored credentials
+                "secrete_access": "",
+                "region": "",
+                "instance_id": tag_id or "",  # worker uses Meta.tag_id first, then Aws.instance_id
+            },
+            "Mail": {
+                "inc_number": inc_number,
+                "subject": Req.short_description,
+                "message": message_text,
+            },
+            "Meta": {
+                "user_id": user_id,
+                "tag_id": tag_id,
+            },
         }
-    })
-    content_hash = hashlib.sha256(message_body.encode()).hexdigest()
-    unique_id = f"{content_hash}-{uuid.uuid4().hex}"
-    sqsqueue.send_message(
-        MessageBody=message_body,
-        MessageGroupId=(Req.inc_number or "infraai").strip()[:128],  # per-incident with safe fallback
-        MessageDeduplicationId=unique_id
     )
 
-    return {"response": {"user_id": user_id}}
+    content_hash = hashlib.sha256(message_body.encode()).hexdigest()
+    unique_id = f"{content_hash}-{uuid.uuid4().hex}"
+
+    sqsqueue.send_message(
+        MessageBody=message_body,
+        MessageGroupId=(inc_number or "infraai").strip()[:128],  # per-incident with safe fallback
+        MessageDeduplicationId=unique_id,
+    )
+
+    return {"response": {"user_id": user_id, "inc_number": inc_number}}

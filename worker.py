@@ -18,6 +18,24 @@ from typing import List, Optional, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
+# Shared integrations (same code-path as backend API + chat tools)
+from integrations.github import (
+    get_github_config,
+    github_search_issues as github_search_issues_impl,
+)
+from integrations.jira import (
+    get_jira_config,
+    jira_search_issues as jira_search_issues_impl,
+)
+from integrations.confluence import (
+    get_confluence_config,
+    confluence_search_pages as confluence_search_pages_impl,
+)
+from integrations.pagerduty import (
+    get_pagerduty_config,
+    pagerduty_list_incidents as pagerduty_list_incidents_impl,
+)
+
 # --- CONFIG ---
 LOG_FILE = "infra_worker.log"
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
@@ -413,6 +431,161 @@ def fetch_prometheus_metrics(prom_cfg: dict, cmdb: dict, incident: dict, ctx_log
         return ""
 
 
+def _sanitize_query_text(text: str, max_len: int = 200) -> str:
+    """Make a safe, short query string for external systems (JQL/CQL/GitHub search)."""
+    t = (text or "").strip()
+    t = re.sub(r"[\r\n\t]+", " ", t)
+    # Remove characters that commonly break query syntaxes
+    t = re.sub(r"[\"\\]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > max_len:
+        t = t[:max_len].rstrip()
+    return t
+
+
+def fetch_external_integrations_context(email: str, incident: dict, ctx_logger=None) -> str:
+    """Fetch supporting context from configured external systems.
+
+    This allows the worker to use the same integrations as the chat endpoint:
+    - GitHub issues/PRs search
+    - Jira issues search
+    - Confluence page search
+    - PagerDuty incidents list
+
+    For each integration we first check whether credentials are configured
+    for this user (based on what they entered on the Credentials page).
+    We then:
+      * log a clear message if the integration is not configured
+      * only call the external API when credentials are present
+      * return a JSON blob that includes both `credential_status` and
+        any fetched `sources`.
+
+    Returns a JSON string suitable for adding into the incident diagnostic prompt.
+    """
+    l = ctx_logger or logger
+    try:
+        subj = incident.get("subject") or ""
+        msg = incident.get("message") or ""
+        q = _sanitize_query_text(f"{subj} {msg}")
+        if not q:
+            return ""
+
+        out: Dict[str, Any] = {
+            "query": q,
+            "credential_status": {},
+            "sources": {},
+        }
+
+        # --- GitHub ---
+        try:
+            gh_cfg = get_github_config(email)
+            gh_configured = bool(gh_cfg.get("token"))
+            out["credential_status"]["github"] = {
+                "configured": gh_configured,
+                "has_default_repo": bool(gh_cfg.get("default_owner") and gh_cfg.get("default_repo")),
+            }
+            if gh_configured:
+                l.info("GitHub integration configured for this user; fetching GitHub context")
+                gh = github_search_issues_impl(mail=email, query=q, max_results=5)
+                out["sources"]["github"] = gh
+            else:
+                l.info("GitHub integration not configured for this user; skipping GitHub context")
+        except Exception as e:
+            l.debug(f"GitHub integration lookup failed: {str(e)}")
+            out["credential_status"]["github"] = {
+                "configured": False,
+                "error": str(e),
+            }
+
+        # --- Jira ---
+        try:
+            jira_cfg = get_jira_config(email)
+            jira_configured = bool(
+                jira_cfg.get("base_url")
+                and jira_cfg.get("api_token")
+                and jira_cfg.get("email")
+            )
+            out["credential_status"]["jira"] = {
+                "configured": jira_configured,
+            }
+            if jira_configured:
+                l.info("Jira integration configured for this user; fetching Jira context")
+                jql = f'text ~ "{q}" ORDER BY updated DESC'
+                ji = jira_search_issues_impl(mail=email, jql=jql, max_results=5)
+                out["sources"]["jira"] = ji
+            else:
+                l.info("Jira integration not configured for this user; skipping Jira context")
+        except Exception as e:
+            l.debug(f"Jira integration lookup failed: {str(e)}")
+            out["credential_status"]["jira"] = {
+                "configured": False,
+                "error": str(e),
+            }
+
+        # --- Confluence ---
+        try:
+            conf_cfg = get_confluence_config(email)
+            conf_configured = bool(
+                conf_cfg.get("base_url")
+                and conf_cfg.get("api_token")
+                and conf_cfg.get("email")
+            )
+            out["credential_status"]["confluence"] = {
+                "configured": conf_configured,
+            }
+            if conf_configured:
+                l.info("Confluence integration configured for this user; fetching Confluence context")
+                cql = f'text ~ "{q}" ORDER BY lastmodified DESC'
+                cf = confluence_search_pages_impl(mail=email, cql=cql, limit=5)
+                out["sources"]["confluence"] = cf
+            else:
+                l.info("Confluence integration not configured for this user; skipping Confluence context")
+        except Exception as e:
+            l.debug(f"Confluence integration lookup failed: {str(e)}")
+            out["credential_status"]["confluence"] = {
+                "configured": False,
+                "error": str(e),
+            }
+
+        # --- PagerDuty ---
+        try:
+            pd_cfg = get_pagerduty_config(email)
+            pd_configured = bool(pd_cfg.get("api_token"))
+            out["credential_status"]["pagerduty"] = {
+                "configured": pd_configured,
+            }
+            if pd_configured:
+                l.info("PagerDuty integration configured for this user; fetching PagerDuty context")
+                pd = pagerduty_list_incidents_impl(
+                    mail=email,
+                    statuses=["triggered", "acknowledged"],
+                    limit=10,
+                )
+                out["sources"]["pagerduty"] = pd
+            else:
+                l.info("PagerDuty integration not configured for this user; skipping PagerDuty context")
+        except Exception as e:
+            l.debug(f"PagerDuty integration lookup failed: {str(e)}")
+            out["credential_status"]["pagerduty"] = {
+                "configured": False,
+                "error": str(e),
+            }
+
+        # If nothing is configured or all lookups failed, avoid adding empty noise
+        if not out["sources"]:
+            any_configured = any(
+                v.get("configured") for v in out["credential_status"].values()
+            )
+            if not any_configured:
+                l.info("No external integrations are configured for this user; skipping external context")
+                return ""
+
+        return json.dumps(out, indent=2)
+    except Exception as e:
+        l.debug(f"External integrations context failed: {str(e)}")
+        return ""
+
+
 # --- Utility functions ---
 def get_username(os_type: str) -> str:
     os_type = (os_type or "").lower()
@@ -567,6 +740,7 @@ def collect_diagnostics(
     cmdb: dict,
     kb_context: str = "",
     prometheus_context: str = "",
+    external_context: str = "",
     ctx_logger=None,
 ) -> dict:
     l = ctx_logger or logger
@@ -598,12 +772,26 @@ Use this metrics context when deciding what diagnostics to run and how to priori
 No Prometheus metrics could be retrieved for this incident. Proceed without using Prometheus data.
 """
 
+    if external_context:
+        ext_block = f"""
+Supporting context from external systems (GitHub/Jira/Confluence/PagerDuty):
+
+{external_context}
+
+Use this to recognize known issues, link relevant tickets/runbooks, and speed up diagnosis.
+"""
+    else:
+        ext_block = """
+No additional context could be retrieved from external systems.
+"""
+
     prompt = f"""
 Incident: {incident.get('subject')} - {incident.get('message')}
 System: {cmdb.get('os')} at {cmdb.get('ip')}
 
 {kb_block}
 {prom_block}
+{ext_block}
 Create a diagnostic plan with specific commands to collect information.
 {SYSTEM_PROMPT}
 """
@@ -842,12 +1030,22 @@ def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_log
             else:
                 ctx.info("No Prometheus configuration found; skipping Prometheus metrics")
 
+        # Optional external integrations context (GitHub/Jira/Confluence/PagerDuty)
+        external_context = ""
+        try:
+            ctx.info("Fetching external integrations context")
+            external_context = fetch_external_integrations_context(email, mail, ctx_logger=ctx)
+        except Exception as e:
+            ctx.debug(f"External integrations context collection failed: {str(e)}")
+            external_context = ""
+
         ctx.info("Collecting diagnostics")
         diagnostics = collect_diagnostics(
             mail,
             cmdb,
             kb_context=kb_info.get("combined_context", "") if kb_info else "",
             prometheus_context=prometheus_context,
+            external_context=external_context,
             ctx_logger=ctx,
         )
 
