@@ -69,6 +69,9 @@ genai.configure(api_key=os.getenv('Gemini_Api_Key'))
 PINECONE_KB_INDEX_NAME = os.getenv("PINECONE_KB_INDEX_NAME", "infraai")
 KB_TOP_K_DEFAULT = int(os.getenv("KB_TOP_K_DEFAULT", "5"))
 KB_SCORE_THRESHOLD_DEFAULT = float(os.getenv("KB_SCORE_THRESHOLD_DEFAULT", "0.7"))
+# Path to the global architecture knowledge-base Markdown file. This document
+# is treated as base context for all worker KB queries when present.
+ARCHITECTURE_KB_FILE_PATH = os.getenv("ARCHITECTURE_KB_FILE_PATH", "architecture_kb.md")
 
 OPENROUTER_API_KEY = os.getenv("openrouter")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -119,7 +122,21 @@ def call_llm(
     response = llm.invoke(messages)
     return response.content
 
-SYSTEM_PROMPT = '''You are an AI incident resolver agent. When given an incident description, create a structured plan with these steps:
+SYSTEM_PROMPT = '''You are an AI incident resolver agent running inside infra.ai's background worker.
+
+You are always given:
+- A structured incident description.
+- System information for the affected host (OS, IP).
+- Optional runbook / SOP context from the internal knowledge base.
+- Optional metrics context from Prometheus.
+- Optional context from external systems (GitHub, Jira, Confluence, PagerDuty).
+
+You MUST:
+- Read and use all of the context provided above before proposing commands.
+- Prefer explicit runbook/SOP instructions over generic best practices when they are available.
+- Treat metrics and external system data as authoritative signals when deciding what to check first.
+
+When given an incident description, create a structured plan with these steps:
 1. Collect diagnostic information (logs, metrics, system state)
 2. Analyze root cause
 3. Generate resolution steps
@@ -128,7 +145,8 @@ SYSTEM_PROMPT = '''You are an AI incident resolver agent. When given an incident
 
 For each step, provide specific commands to run. Always:
 - Use non-interactive commands
-- Include error handling
+- Include safe, read-only diagnostics before any destructive actions
+- Avoid rebooting systems or restarting critical services unless clearly justified
 - Verify command success before proceeding
 - Use appropriate tools for the environment
 - Return structured JSON output with status and results
@@ -241,6 +259,23 @@ def _embed_texts(texts: List[str], ctx_logger=None) -> List[List[float]]:
         return []
 
 
+def _get_architecture_kb_text() -> str:
+    """Return the contents of the global architecture KB Markdown file, if any.
+
+    If the file does not exist or cannot be read, an empty string is returned.
+    """
+    path = ARCHITECTURE_KB_FILE_PATH
+    if not path:
+        return ""
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
 def query_knowledge_base(
     query: str,
     top_k: int = KB_TOP_K_DEFAULT,
@@ -249,56 +284,77 @@ def query_knowledge_base(
 ) -> List[dict]:
     l = ctx_logger or logger
     if not query or not query.strip():
-        return []
-
-    index = _get_kb_index(ctx_logger=l)
-    if index is None:
-        return []
-
-    embeddings = _embed_texts([query], ctx_logger=l)
-    if not embeddings:
-        return []
-
-    try:
-        res = index.query(
-            vector=embeddings[0],
-            top_k=top_k,
-            include_metadata=True,
-        )
-    except Exception as e:
-        l.warning(f"Failed to query knowledge base: {str(e)}")
-        return []
-
-    matches_raw = []
-    if isinstance(res, dict):
-        matches_raw = res.get("matches", [])
-    elif hasattr(res, "to_dict"):
-        res_dict = res.to_dict()
-        matches_raw = res_dict.get("matches", [])
-    elif hasattr(res, "matches"):
-        matches_raw = res.matches
-
-    matches: List[dict] = []
-    for m in matches_raw or []:
-        if isinstance(m, dict):
-            score = m.get("score")
-            metadata = m.get("metadata") or {}
+        matches: List[dict] = []
+    else:
+        index = _get_kb_index(ctx_logger=l)
+        if index is None:
+            matches = []
         else:
-            score = getattr(m, "score", None)
-            metadata = getattr(m, "metadata", {}) or {}
-        if score is None:
-            continue
-        if score_threshold is not None and float(score) < float(score_threshold):
-            continue
-        matches.append(
+            embeddings = _embed_texts([query], ctx_logger=l)
+            if not embeddings:
+                matches = []
+            else:
+                try:
+                    res = index.query(
+                        vector=embeddings[0],
+                        top_k=top_k,
+                        include_metadata=True,
+                    )
+                except Exception as e:
+                    l.warning(f"Failed to query knowledge base: {str(e)}")
+                    matches = []
+                else:
+                    matches_raw = []
+                    if isinstance(res, dict):
+                        matches_raw = res.get("matches", [])
+                    elif hasattr(res, "to_dict"):
+                        res_dict = res.to_dict()
+                        matches_raw = res_dict.get("matches", [])
+                    elif hasattr(res, "matches"):
+                        matches_raw = res.matches
+
+                    matches = []
+                    for m in matches_raw or []:
+                        if isinstance(m, dict):
+                            score = m.get("score")
+                            metadata = m.get("metadata") or {}
+                        else:
+                            score = getattr(m, "score", None)
+                            metadata = getattr(m, "metadata", {}) or {}
+                        if score is None:
+                            continue
+                        if score_threshold is not None and float(score) < float(score_threshold):
+                            continue
+                        matches.append(
+                            {
+                                "score": float(score),
+                                "text": metadata.get("text", ""),
+                                "source": metadata.get("source_file_name") or metadata.get("source") or "",
+                                "doc_id": metadata.get("doc_id") or "",
+                                "chunk_index": metadata.get("chunk_index"),
+                            }
+                        )
+
+    # Always prepend the architecture KB document (if present) so that it acts
+    # as base knowledge for everything the worker does.
+    arch_text = ""
+    try:
+        arch_text = _get_architecture_kb_text()
+    except Exception:
+        arch_text = ""
+
+    if arch_text and arch_text.strip():
+        matches.insert(
+            0,
             {
-                "score": float(score),
-                "text": metadata.get("text", ""),
-                "source": metadata.get("source_file_name") or metadata.get("source") or "",
-                "doc_id": metadata.get("doc_id") or "",
-                "chunk_index": metadata.get("chunk_index"),
-            }
+                "score": 1.0,
+                "text": arch_text,
+                "source": "architecture_kb",
+                "doc_id": "architecture_kb",
+                "chunk_index": 0,
+            },
         )
+
     return matches
 
 
