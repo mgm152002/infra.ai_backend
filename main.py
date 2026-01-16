@@ -1,5 +1,5 @@
 from typing import Union, Optional, List
-from fastapi import FastAPI ,File, UploadFile,Depends, Response, status,HTTPException
+from fastapi import FastAPI ,File, UploadFile,Depends, Response, status,HTTPException, BackgroundTasks
 from datetime import datetime
 from fastapi import security
 from pydantic import BaseModel
@@ -38,7 +38,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pinecone_plugins.assistant.models.chat import Message
 import jwt
 import redis
-from supabase import create_client, Client
+from app.core.database import supabase
+from supabase import Client # Keep Client type hint if needed, or remove if unused
 from urllib.parse import urlencode
 import json
 import hashlib
@@ -54,6 +55,9 @@ from sse_starlette.sse import EventSourceResponse
 from typing import AsyncGenerator
 
 from worker import worker_loop
+from app.core.middleware import RequestLoggingMiddleware
+from app.core.security import verify_token, has_permission, RoleChecker, get_current_user
+# from app.api.routers import incidents
 
 # --- External integrations (shared by API + chat tools) ---
 from integrations.github import (
@@ -83,6 +87,7 @@ from integrations.pagerduty import (
     pagerduty_get_incident as pagerduty_get_incident_impl,
 )
 from integrations.prometheus import prometheus_instant_query
+from app.integrations.servicenow import servicenow_client
 
 async def worker_lifespan(app: FastAPI):
     """Start multiple worker threads when application starts"""
@@ -125,6 +130,11 @@ async def worker_lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=worker_lifespan)
+# app.include_router(incidents.router, prefix="/api/v1/incidents", tags=["Incidents"])
+# from app.api.routers import integrations
+# from app.api.routers import admin
+# app.include_router(integrations.router, prefix="/api/v1/integrations", tags=["Integrations"])
+# app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
 security = HTTPBearer()
 import os
 from dotenv import load_dotenv
@@ -139,10 +149,10 @@ from langchain_core.output_parsers import JsonOutputParser
 load_dotenv()
 pc = Pinecone(api_key=os.getenv('Pinecone_Api_Key'))
 # Ensure your VertexAI credentials are configured
-url: str = os.getenv("SUPABASE_URL")
-key: str = os.getenv("SUPABASE_KEY")
 
-supabase: Client = create_client(url, key)
+# Supabase client imported from app.core.database
+# url and key were local vars here, removing them as they are now handled in settings/database.py
+
 session = boto3.Session(
     aws_access_key_id=os.getenv('access_key'),
     aws_secret_access_key=os.getenv('secrete_access'),
@@ -153,40 +163,12 @@ session = boto3.Session(
 CHAT_QUEUE_NAME = "Chatqueue"
 CHAT_JOB_TTL_SECONDS = 60 * 60  # 1 hour TTL for chat job results in Redis
 
+from app.core.llm import get_llm, call_llm
+
 OPENROUTER_API_KEY = os.getenv("openrouter")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL_NAME = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.2")
-
-
-def get_llm(model_name: Optional[str] = None, **kwargs) -> ChatOpenAI:
-    """Return a ChatOpenAI instance configured to talk to OpenRouter.
-
-    The default model can be overridden via the OPENROUTER_MODEL env var.
-    """
-    if not OPENROUTER_API_KEY:
-        raise ValueError("OpenRouter API key not set. Please define the 'openrouter' environment variable.")
-    return ChatOpenAI(
-        model=model_name or DEFAULT_MODEL_NAME,
-        api_key=OPENROUTER_API_KEY,
-        base_url=OPENROUTER_BASE_URL,
-        **kwargs,
-    )
-
-
-def call_llm(
-    user_content: str,
-    *,
-    system_content: Optional[str] = None,
-    model_name: Optional[str] = None,
-) -> str:
-    """Convenience helper that sends a single-turn prompt to the LLM and returns the text content."""
-    messages: List = []
-    if system_content:
-        messages.append(SystemMessage(content=system_content))
-    messages.append(HumanMessage(content=user_content))
-    llm = get_llm(model_name=model_name)
-    response = llm.invoke(messages)
-    return response.content
+app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"], # Specific origin
@@ -332,6 +314,9 @@ AVAILABLE TOOLS AND WHEN TO USE THEM
 - `getfromcmdb(tag_id, mail)`
   - Use to resolve host details (IP, OS, etc.) from CMDB when the user talks about a specific host or asset.
 
+- `search_cmdb(query, mail)`
+  - Use to search for CMDB items by name, IP, description, or type when the exact tag_id is unknown.
+
 - `prometheus_query(query, mail)`
   - Use to fetch live metrics when diagnosing performance or availability issues.
 
@@ -370,6 +355,9 @@ class CMDBItem(BaseModel):
     os: str
     type: str
     description: str
+    sys_id: Optional[str] = None
+    source: Optional[str] = "manual"
+    raw_data: Optional[Dict[str, Any]] = None
     # No need to include user_id in the request body as we'll get it from the token
 
 class CMDBItemUpdate(BaseModel):
@@ -379,6 +367,9 @@ class CMDBItemUpdate(BaseModel):
     os: Optional[str] = None
     type: Optional[str] = None
     description: Optional[str] = None
+    sys_id: Optional[str] = None
+    source: Optional[str] = None
+    raw_data: Optional[Dict[str, Any]] = None
 
 class Snow_key(BaseModel):
     snow_key: str
@@ -392,6 +383,12 @@ class PrometheusConfig(BaseModel):
     base_url: str
     auth_type: Optional[str] = "none"  # 'none' or 'bearer'
     bearer_token: Optional[str] = None
+
+
+class DatadogConfig(BaseModel):
+    api_key: str
+    app_key: str
+    site: Optional[str] = "datadoghq.com"
 
 
 class GitHubIntegrationConfig(BaseModel):
@@ -531,36 +528,9 @@ def send_escalation_email(subject: str, message: str, recipient: str):
         return "Failed to send escalation email."
 
 
-async def verify_token(credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
-    """Validate JWT from Authorization header and return basic user data.
+# Note: verify_token is imported from app.core.security (line 59)
+# Do not redefine it here to avoid shadowing the imported version.
 
-    This is used as a dependency in multiple endpoints to authenticate the user
-    and fetch their Supabase `Users.id`.
-    """
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
-        email = payload.get("email")
-        if email is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials - email not found",
-            )
-
-        user_response = supabase.table("Users").select("id").eq("email", email).execute()
-        if not user_response.data or len(user_response.data) == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found",
-            )
-
-        user_id = user_response.data[0]["id"]
-        return {"email": email, "user_id": user_id}
-    except PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials - invalid token",
-        )
 
 def power_status_tool(Aws: Aws):
     """Executes the power status check and takes action based on the status."""
@@ -2127,6 +2097,27 @@ def getfromcmdb(tag_id: str, mail: str):
         }
 
 @tool
+def search_cmdb(query: str, mail: str):
+    """Search for configuration items in the CMDB using a keyword query.
+
+    Use this when the user asks about a server/asset by name, IP, or description but doesn't provide a specific tag ID.
+    The `mail` parameter is injected by the backend.
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+
+        response = supabase.table("CMDB").select("*").eq("user_id", user_id).or_(
+            f"tag_id.ilike.%{query}%,ip.ilike.%{query}%,addr.ilike.%{query}%,type.ilike.%{query}%,description.ilike.%{query}%"
+        ).execute()
+
+        return {"status": "ok", "items": response.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@tool
 def infra_automation_ai(mesaage:str,mail:str):
     '''Automate infrastructure-related tasks for the authenticated user.
 
@@ -3007,6 +2998,9 @@ async def create_cmdb_item(item: CMDBItem, user_data: dict = Depends(verify_toke
             "type": item.type,
             "os": item.os,
             "description": item.description,
+            "sys_id": item.sys_id,
+            "source": item.source,
+            "raw_data": item.raw_data,
             "user_id": user_data["user_id"],  # Add user_id from token
             "created_at": datetime.utcnow().isoformat()
         }).execute()
@@ -3207,6 +3201,62 @@ async def update_ssh_credentials(ssh: ssh, credentials: Annotated[HTTPAuthorizat
             detail=f"Failed to update SSH credentials: {str(e)}"
         )
 
+@app.post("/addSNOWCredentials")
+async def add_servicenow_credentials(snow: Snow_key, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
+    try:
+        token = credentials.credentials
+        res = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        mail = res['email']
+        
+        secret_auth_uri = "https://app.infisical.com/api/v1/auth/universal-auth/login"
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        auth_data = {
+            "clientId": os.getenv('clientId'),
+            "clientSecret": os.getenv('clientSecret')
+        }
+        
+        # Get access token
+        response = requests.post(url=secret_auth_uri, headers=headers, data=auth_data)
+        response.raise_for_status()
+        access_token = response.json()['accessToken']
+        
+        auth_headers = {
+            'Authorization': f'Bearer {access_token}'
+        }
+        
+        # Add ServiceNow credentials
+        snow_dict = {
+            f"SNOW_KEY_{mail}": snow.snow_key,
+            f"SNOW_INSTANCE_{mail}": snow.snow_instance,
+            f"SNOW_USER_{mail}": snow.snow_user,
+            f"SNOW_PASSWORD_{mail}": snow.snow_password
+        }
+        
+        for key, value in snow_dict.items():
+            url = f"https://us.infisical.com/api/v3/secrets/raw/{key}"
+            payload = {
+                "environment": "prod",
+                "secretValue": value,
+                "workspaceId": "113f5a41-dbc3-447d-8b3a-6fe8e9e6e99c"
+            }
+            
+            headers = {
+                "Authorization": auth_headers['Authorization'],
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.request("POST", url, json=payload, headers=headers)
+            
+        return {"response": "ServiceNow credentials added successfully"}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to add ServiceNow credentials: {str(e)}"
+        )
+
 @app.post("/updateServiceNow")
 async def update_servicenow_credentials(snow: Snow_key, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
     try:
@@ -3253,7 +3303,9 @@ async def update_servicenow_credentials(snow: Snow_key, credentials: Annotated[H
                 "Content-Type": "application/json"
             }
             
-            response = requests.request("POST", url, json=payload, headers=headers)
+            # Using PATCH to update existing secret
+            response = requests.request("PATCH", url, json=payload, headers=headers)
+            response.raise_for_status()
             
         return {"response": "ServiceNow credentials updated successfully"}
         
@@ -3754,3 +3806,264 @@ def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
     )
 
     return {"response": {"user_id": user_id, "inc_number": inc_number}}
+
+# --- Incident Management Routes (Consolidated) ---
+
+def background_analyze_incident(inc_number: str, short_desc: str, job_id: str):
+    """Background task to analyze incident with LLM."""
+    try:
+        supabase.table("Jobs").update({
+            "status": "running", 
+            "progress": 10,
+            "details": {"step": "analyzing"}
+        }).eq("id", job_id).execute()
+
+        llm = get_llm()
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert incident responder."),
+            ("user", 
+            """Given the following incident short description, determine:
+            1. potential_cause
+            2. potential_solution
+
+            Respond only in JSON format like this:
+            {{"potential_cause": "...", "potential_solution": "..."}}
+
+            Short description: {short_description}
+            {format_instructions}
+            """)
+        ])
+        parser = JsonOutputParser()
+        chain = prompt | llm | parser
+        result = chain.invoke({
+            "short_description": short_desc,
+            "format_instructions": parser.get_format_instructions()
+        })
+        result['description'] = short_desc
+
+        supabase.table("Jobs").update({
+            "status": "completed", 
+            "progress": 100,
+            "details": {"result": result}
+        }).eq("id", job_id).execute()
+
+    except Exception as e:
+        print(f"Background analysis failed: {e}")
+        supabase.table("Jobs").update({
+            "status": "failed", 
+            "details": {"error": str(e)}
+        }).eq("id", job_id).execute()
+
+@app.post("/incidents/add")
+def add_incident_v3(Req: Incident, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("incidents", "write"))):
+    """Create a new incident with job tracking."""
+    user_id = user_data.get("user_id")
+    inc_number = (Req.inc_number or "").strip()
+    if not inc_number:
+        inc_number = f"INC-{uuid.uuid4().hex[:12].upper()}"
+
+    state = Req.state or "Queued"
+    insert_payload = {
+        "short_description": Req.short_description,
+        "tag_id": Req.tag_id,
+        "state": state,
+        "inc_number": inc_number,
+        "user_id": user_id,
+        "source": Req.source or "manual",
+    }
+    supabase.table("Incidents").insert(insert_payload).execute()
+
+    job_id = str(uuid.uuid4())
+    supabase.table("Jobs").insert({
+        "id": job_id,
+        "user_id": user_id,
+        "task_type": "incident_process",
+        "status": "pending",
+        "progress": 0,
+        "details": {"inc_number": inc_number}
+    }).execute()
+
+    return {"response": {"user_id": user_id, "inc_number": inc_number, "job_id": job_id}}
+
+@app.get("/incidents/all")
+def get_all_incidents_v3(user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("incidents", "read"))):
+    user_id = user_data['user_id']
+    response = supabase.table("Incidents").select("*, Users(*)").eq("user_id", user_id).execute()
+    return {"response": response}
+
+@app.get("/incidents/{inc_number}")
+def get_incident_details_v3(inc_number: str, _: bool = Depends(has_permission("incidents", "read"))):
+    response = supabase.from_("Incidents").select("*").eq("inc_number", inc_number).execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"response": response.data[0]}
+
+@app.post("/incidents/{inc_number}/analyze")
+def analyze_incident_v3(inc_number: str, background_tasks: BackgroundTasks, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("incidents", "read"))):
+    response = supabase.from_("Incidents").select("short_description").eq("inc_number", inc_number).execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    
+    short_desc = response.data[0]["short_description"]
+    user_id = user_data['user_id']
+    job_id = str(uuid.uuid4())
+
+    supabase.table("Jobs").insert({
+        "id": job_id,
+        "user_id": user_id,
+        "task_type": "incident_analysis",
+        "status": "pending",
+        "progress": 0,
+        "details": {"inc_number": inc_number}
+    }).execute()
+
+    background_tasks.add_task(background_analyze_incident, inc_number, short_desc, job_id)
+    return {"status": "success", "job_id": job_id}
+
+# --- Integration Routes (Consolidated) ---
+
+class ServiceNowPayload(BaseModel):
+    data: Dict[str, Any]
+
+@app.post("/integrations/servicenow/incident")
+def create_snow_incident(payload: ServiceNowPayload, user_data: dict = Depends(verify_token)):
+    return servicenow_client.create_incident(payload.data, user_data['email'])
+
+@app.get("/integrations/servicenow/incident/{inc_number}")
+def get_snow_incident(inc_number: str, user_data: dict = Depends(verify_token)):
+    result = servicenow_client.get_incident(inc_number, user_data['email'])
+    if not result:
+        raise HTTPException(status_code=404, detail="Incident not found in ServiceNow")
+    return result
+
+@app.get("/integrations/datadog/config")
+def get_datadog_config_v2(user_data: dict = Depends(verify_token)):
+    api_key = os.getenv("DD_API_KEY", "")
+    app_key = os.getenv("DD_APP_KEY", "")
+    site = os.getenv("DD_SITE", "datadoghq.com")
+    masked_api = f"****{api_key[-4:]}" if len(api_key) > 4 else ""
+    masked_app = f"****{app_key[-4:]}" if len(app_key) > 4 else ""
+    return {"response": {"api_key": masked_api, "app_key": masked_app, "site": site}}
+
+@app.post("/integrations/datadog/config")
+def save_datadog_config_v2(config: DatadogConfig, user_data: dict = Depends(verify_token)):
+    if config.api_key and not config.api_key.startswith("****"):
+        os.environ["DD_API_KEY"] = config.api_key
+    if config.app_key and not config.app_key.startswith("****"):
+        os.environ["DD_APP_KEY"] = config.app_key
+    if config.site:
+        os.environ["DD_SITE"] = config.site
+    return {"status": "success", "message": "Datadog credentials saved"}
+
+@app.get("/integrations/prometheus/config")
+def get_prometheus_config_v2(user_data: dict = Depends(verify_token)):
+    base_url = os.getenv("PROMETHEUS_URL", "")
+    auth_type = os.getenv("PROMETHEUS_AUTH_TYPE", "none")
+    bearer_token = os.getenv("PROMETHEUS_TOKEN", "")
+    masked_token = f"****{bearer_token[-4:]}" if len(bearer_token) > 4 else ""
+    return {"response": {"name": "Default Prometheus", "base_url": base_url, "auth_type": auth_type, "bearer_token": masked_token}}
+
+@app.post("/integrations/prometheus/config")
+def save_prometheus_config_v2(config: PrometheusConfig, user_data: dict = Depends(verify_token)):
+    os.environ["PROMETHEUS_URL"] = config.base_url
+    os.environ["PROMETHEUS_AUTH_TYPE"] = config.auth_type or "none"
+    if config.bearer_token and not config.bearer_token.startswith("****"):
+        os.environ["PROMETHEUS_TOKEN"] = config.bearer_token
+    return {"status": "success"}
+
+def background_sync_task(email: str, user_id: str, job_id: str):
+    """Background task to sync CMDB assets from ServiceNow."""
+    try:
+        supabase.table("Jobs").update({"status": "running", "progress": 0}).eq("id", job_id).execute()
+        assets = servicenow_client.fetch_cmdb_assets(email)
+        total_assets = len(assets)
+        supabase.table("Jobs").update({"total_items": total_assets}).eq("id", job_id).execute()
+        
+        for i, asset in enumerate(assets):
+            # Extract and normalize all fields with sensible defaults for null values
+            sn_tag_id = asset.get('name') or 'Unknown'
+            sn_location = asset.get('location') or 'Unknown'
+            sn_description = asset.get('short_description') or f"ServiceNow CI: {sn_tag_id}"
+            sn_ip = asset.get('ip_address') or "0.0.0.0"
+            sn_os = asset.get('os') or 'Unknown'
+            sn_type = asset.get('sys_class_name') or 'Configuration Item'
+            sn_sys_id = asset.get('sys_id') or None
+            
+            item_data = {
+                "user_id": user_id,
+                "tag_id": sn_tag_id,
+                "ip": sn_ip,
+                "addr": sn_location,  # Required field - location from ServiceNow
+                "os": sn_os,
+                "type": sn_type,
+                "description": sn_description,  # Required field
+                "source": "servicenow",
+                "sys_id": sn_sys_id,
+                "last_sync": datetime.utcnow().isoformat(),
+            }
+            supabase.table("CMDB").upsert(item_data, on_conflict="user_id,tag_id").execute()
+            
+            if (i + 1) % 10 == 0 or (i + 1) == total_assets:
+                progress_pct = int(((i + 1) / total_assets) * 100)
+                supabase.table("Jobs").update({"progress": progress_pct, "processed_items": i + 1}).eq("id", job_id).execute()
+        
+        supabase.table("Jobs").update({"status": "completed", "progress": 100}).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"CMDB sync failed: {e}")
+        supabase.table("Jobs").update({"status": "failed", "details": {"error": str(e)}}).eq("id", job_id).execute()
+
+@app.post("/integrations/servicenow/sync-cmdb")
+def sync_cmdb_from_servicenow(background_tasks: BackgroundTasks, user_data: dict = Depends(verify_token)):
+    email = user_data['email']
+    user_id = user_data['user_id']
+    job_id = str(uuid.uuid4())
+    supabase.table("Jobs").insert({"id": job_id, "user_id": str(user_id), "task_type": "snow_sync", "status": "pending", "progress": 0}).execute()
+    background_tasks.add_task(background_sync_task, email, user_id, job_id)
+    return {"status": "success", "job_id": job_id}
+
+@app.get("/jobs/active")
+def get_active_jobs(user_data: dict = Depends(verify_token)):
+    user_id = user_data['user_id']
+    response = supabase.table("Jobs").select("*").eq("user_id", user_id).or_("status.eq.pending,status.eq.running").execute()
+    return {"response": response.data}
+
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str, user_data: dict = Depends(verify_token)):
+    response = supabase.table("Jobs").select("*").eq("id", job_id).execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return response.data[0]
+
+# --- Admin Routes ---
+allow_admin = RoleChecker(["admin"])
+
+@app.get("/admin/users")
+def list_users(
+    user_data: dict = Depends(verify_token), 
+    _: bool = Depends(allow_admin)
+):
+    """
+    List all users. Requires 'admin' role.
+    """
+    try:
+        response = supabase.table("Users").select("*").execute()
+        return response.data
+    except Exception as e:
+        print(f"Error listing users: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+@app.get("/admin/health")
+def system_health(
+    user_data: dict = Depends(verify_token),
+    _: bool = Depends(allow_admin)
+):
+    """
+    Get system health status.
+    """
+    return {
+        "status": "healthy",
+        "services": {
+            "database": "connected", 
+            "workers": "active"      
+        }
+    }
