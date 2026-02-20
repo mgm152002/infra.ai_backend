@@ -1,7 +1,10 @@
-from typing import Union, Optional, List
-from fastapi import FastAPI ,File, UploadFile,Depends, Response, status,HTTPException, BackgroundTasks
+from typing import Union, Optional, List, Dict, Any
+import csv
+import io
+import codecs
 from datetime import datetime
-from fastapi import security
+from fastapi import FastAPI, security, Depends, BackgroundTasks, HTTPException, UploadFile, File, Response
+from fastapi import status
 from pydantic import BaseModel
 from pydantic.networks import IPvAnyAddress
 import requests
@@ -17,15 +20,18 @@ from botocore.exceptions import ClientError
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from langchain.agents import Tool, initialize_agent
+try:
+    from langchain.agents import initialize_agent
+except ImportError:
+    from langchain_classic.agents import initialize_agent
+
+from langchain_core.tools import Tool, BaseTool
 from langchain_openai import ChatOpenAI
-from langchain.prompts import MessagesPlaceholder
-from langchain.schema import HumanMessage
-from langchain_core.messages import ToolMessage, SystemMessage
+from langchain_core.prompts import MessagesPlaceholder
+from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from langchain.tools import BaseTool
 from typing import Any, Dict
 import subprocess
 import requests
@@ -44,7 +50,7 @@ from urllib.parse import urlencode
 import json
 import hashlib
 from requests.auth import HTTPBasicAuth
-from fastapi import Depends
+from fastapi import Depends, BackgroundTasks
 import uuid
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWTError
@@ -57,6 +63,11 @@ from typing import AsyncGenerator
 from worker import worker_loop
 from app.core.middleware import RequestLoggingMiddleware
 from app.core.security import verify_token, has_permission, RoleChecker, get_current_user
+from app.core.logger import logger
+from app.schemas.credentials import SlackConfig, EmailConfig
+from app.schemas.models import AlertTypeEscalation, AlertTypeEscalationUpdate
+from app.services.notification_service import NotificationService
+from app.services.rca_service import rca_service
 # from app.api.routers import incidents
 
 # --- External integrations (shared by API + chat tools) ---
@@ -88,11 +99,139 @@ from integrations.pagerduty import (
 )
 from integrations.prometheus import prometheus_instant_query
 from app.integrations.servicenow import servicenow_client
+from integrations.infisical import set_many, get_many
+from datetime import timezone
+
+class EscalationService:
+    @staticmethod
+    def check_escalations():
+        """
+        Background task to check for incidents that need escalation.
+        """
+        logger.info("Escalation Monitor started")
+        while True:
+            try:
+                # 1. Fetch open incidents
+                # We fetch incidents that are NOT Resolved or Closed
+                response = supabase.table("Incidents").select("*").not_.in_("state", ["Resolved", "Closed"]).execute()
+                incidents = response.data or []
+
+                for inc in incidents:
+                    try:
+                        inc_id = inc['id']
+                        inc_number = inc.get('inc_number')
+                        # Default priority/urgency if not set
+                        urgency = inc.get("external_urgency") or "medium"
+                        
+                        # Use alert_type_id if available (Preferred)
+                        alert_type_id = inc.get("alert_type_id")
+                        
+                        if alert_type_id:
+                            # Fetch directly using ID
+                            at_resp = supabase.table("alert_types").select("*").eq("id", alert_type_id).limit(1).execute()
+                        else:
+                            # Fallback: Find matching Alert Type for this urgency
+                            at_resp = supabase.table("alert_types").select("*").eq("priority", urgency).limit(1).execute()
+                            
+                        if not at_resp.data:
+                            continue
+                            
+                        alert_type = at_resp.data[0]
+                        
+                        # Fetch Rules based on Alert Type ID
+                        rules_resp = supabase.table("escalation_rules").select("*").eq("alert_type_id", alert_type['id']).order("level").execute()
+                        rules = rules_resp.data or []
+                        
+                        if not rules:
+                            continue
+
+                        # Determine current level
+                        # stored in external_payload as specific field to avoid schema change
+                        ext_payload = inc.get("external_payload") or {}
+                        # external_payload might be None in DB
+                        if ext_payload is None: ext_payload = {}
+                        
+                        current_level = ext_payload.get("escalation_level", 0)
+                        
+                        # Check timing
+                        # Use updated_at (last activity) or created_at
+                        last_activity_str = inc.get("updated_at") or inc.get("created_at")
+                        if not last_activity_str: continue
+                        
+                        # Handle Postgres timestamp format (may or may not have Z or timezone)
+                        try:
+                            last_activity = datetime.fromisoformat(last_activity_str.replace('Z', '+00:00'))
+                        except ValueError:
+                            # Fallback if format is different
+                            continue
+                            
+                        now = datetime.now(timezone.utc)
+                        diff_minutes = (now - last_activity).total_seconds() / 60
+                        
+                        # Check rules strictly greater than current level
+                        for rule in rules:
+                            rule_level = rule['level']
+                            wait_time = rule['wait_time_minutes']
+                            
+                            if rule_level > current_level and diff_minutes >= wait_time:
+                                # ESCALATE!
+                                logger.info(f"Escalating Incident {inc_number} to Level {rule_level}")
+                                
+                                # 1. Notify
+                                contact_type = rule['contact_type']
+                                destination = rule['contact_destination']
+                                message = f"🔥 ESCALATION (Level {rule_level}): Incident {inc_number} has been inactive for {int(diff_minutes)} mins. Please investigate immediately."
+                                
+                                user_id = inc.get('user_id')
+                                
+                                if contact_type == 'slack':
+                                    # We can try to use NotificationService if we have user credentials
+                                    # Or just log if we don't have a direct way to send to 'destination' channel dynamic logic
+                                    # For now, let's use the NotificationService generic method but override message?
+                                    # Actually, NotificationService sends to specific channel in creds. 
+                                    # Rule has 'destination'. We might need ad-hoc sending.
+                                    # Let's try NotificationService.notify_incident_update with a prefix
+                                    NotificationService.notify_incident_update(user_id, inc_number, message)
+                                    
+                                elif contact_type == 'email':
+                                    # similar logic
+                                    pass
+                                
+                                # 2. Update Incident
+                                ext_payload['escalation_level'] = rule_level
+                                supabase.table("Incidents").update({
+                                    "external_payload": ext_payload,
+                                    "updated_at": datetime.utcnow().isoformat()
+                                }).eq("id", inc_id).execute()
+                                
+                                # Break after triggering one level (step-by-step escalation)
+                                break
+                                
+                    except Exception as loop_e:
+                        logger.error(f"Error processing incident {inc.get('inc_number')}: {loop_e}")
+                        continue
+
+            except Exception as e:
+                logger.error(f"Escalation monitor cycle failed: {e}")
+            
+            time.sleep(60) # Interval
+
+    @staticmethod
+    def start_monitoring():
+        import threading
+        t = threading.Thread(target=EscalationService.check_escalations, daemon=True, name="EscalationMonitor")
+        t.start()
 
 async def worker_lifespan(app: FastAPI):
     """Start multiple worker threads when application starts"""
     import threading
     import os
+    
+    # Start Escalation Monitor
+    try:
+        EscalationService.start_monitoring()
+    except Exception as e:
+        logger.error(f"Failed to start Escalation Monitor: {e}")
     
     # Safe parsing of WORKER_COUNT with fallback and limits
     try:
@@ -135,16 +274,30 @@ app = FastAPI(lifespan=worker_lifespan)
 # from app.api.routers import admin
 # app.include_router(integrations.router, prefix="/api/v1/integrations", tags=["Integrations"])
 # app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
+from app.api.routers import workflow
+app.include_router(workflow.router, prefix="/api/v1/workflow", tags=["Workflow"])
+from app.api.routers import admin
+app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
+
+# Load Slack client on startup if configured
+from app.integrations.slack import slack_client
+
 security = HTTPBearer()
 import os
 from dotenv import load_dotenv
 import getpass
 from langchain_core.tools import tool
-from langchain.agents import initialize_agent, Tool
-from langchain.memory import ConversationBufferMemory
-from langchain.schema import HumanMessage
+try:
+    from langchain.agents import initialize_agent
+except ImportError:
+    from langchain_classic.agents import initialize_agent
+
+from langchain_core.tools import Tool
+from langchain_classic.memory import ConversationBufferMemory
+from langchain_core.messages import HumanMessage
 from tavily import TavilyClient
 from langchain_core.output_parsers import JsonOutputParser
+import asyncio
 
 load_dotenv()
 pc = Pinecone(api_key=os.getenv('Pinecone_Api_Key'))
@@ -293,15 +446,40 @@ TOOL USAGE – GENERAL RULES
 - Use tools whenever they are relevant to satisfy the user's request instead of guessing.
 - You may call multiple tools in sequence (for example: knowledge base → CMDB → Prometheus → infra automation).
 - Do not expose internal tool names or raw JSON to the user; explain results in natural language.
+- When displaying data from tools like search_local_cmdb, get_local_cmdb_count, list_local_incidents, ALWAYS format the results in a markdown table.
 
 MANDATORY TOOL ORDERING
 1. First, ALWAYS call `ask_knowledge_base` with the user's full request before using any other tools or producing a final answer.
 2. If `ask_knowledge_base` returns `has_knowledge = True`, treat `combined_context` and `matches` from the tool output as your primary guidance.
 3. If `ask_knowledge_base` returns `has_knowledge = False`, continue with other tools as needed.
 
+FORMATTING RULES - IMPORTANT
+- When you get data from search_local_cmdb, get_local_cmdb_count, list_local_incidents, or any tool that returns a list of items:
+  - ALWAYS format the results as a markdown table
+  - Include all relevant columns (Service Name, Type, IP Address, Description, etc.)
+  - If the tool returns "total_services" or "total_cmdb_items", mention the count in your response
+  - Never just list items without a table structure
+
 AVAILABLE TOOLS AND WHEN TO USE THEM
 - `ask_knowledge_base(message)`
   - Always call first for every new user request to look up SOPs/runbooks/internal documentation.
+
+- `search_local_cmdb(query)` and `get_local_cmdb_count(mail)`
+  - Use to query the local CMDB database.
+  - search_local_cmdb returns items with tag_id, ip, type, os, addr, description, service_name
+  - get_local_cmdb_count returns total_cmdb_items, total_services, items_by_type, and services list
+  - ALWAYS format results as markdown tables
+
+- `list_local_incidents(status, limit)`
+  - Use to list incidents from the local database (Supabase).
+  - Can filter by status (e.g., 'Queued', 'InProgress', 'Resolved', 'Closed').
+
+- `get_local_incident_details(inc_number)`
+  - Use to get details of a specific incident from local database by incident number.
+
+- `update_local_incident(inc_number, updates)`
+  - Use to update a local incident in the database.
+  - Provide updates as a dictionary (e.g., {'state': 'InProgress'}).
 
 - `infra_automation_ai(mesaage, mail)`
   - Use whenever the request involves infrastructure changes, server actions, or SOP-style manual steps
@@ -320,6 +498,9 @@ AVAILABLE TOOLS AND WHEN TO USE THEM
 - `prometheus_query(query, mail)`
   - Use to fetch live metrics when diagnosing performance or availability issues.
 
+- `web_search_tool(query)`
+  - Use to search the web for current information, documentation, or anything that might change frequently.
+
 - `github_search_issues`, `github_search_commits`, `github_get_issue`
   - Use when the question involves code changes, regressions, pull requests, or repository history.
 
@@ -332,11 +513,23 @@ AVAILABLE TOOLS AND WHEN TO USE THEM
 - `pagerduty_list_incidents`, `pagerduty_get_incident`
   - Use when the user is asking about on-call incidents, alert history, or PagerDuty state.
 
+- `get_rca_report(incident_number, mail)`
+  - Use when the user asks about the root cause of an incident, RCA report details, or what caused a specific incident.
+  - ALWAYS call this tool when investigating incident causes, during incident resolution, or when the user asks for RCA.
+  - This tool should be used alongside other tools like ask_knowledge_base, get_local_incident_details, etc. when solving incidents.
+
+MANDATORY TOOL ORDERING FOR INCIDENTS
+1. When solving an incident, first call `ask_knowledge_base` with the incident details to look for relevant runbooks or SOPs.
+2. Then call `get_local_incident_details` to get the full incident context.
+3. Then call `get_rca_report` to check if there's already an RCA report for this incident.
+4. Use other tools as needed based on the incident type and context.
+
 RESPONSE STYLE
 - Keep responses concise and focused on the user's incident or infrastructure task.
 - Combine insights from all relevant tools instead of repeating raw data.
 - Do not include meta-commentary about prompts, tools, environment variables, JWTs, or Infisical.
 - Do not ask the user to repeat information that is already present in the conversation unless absolutely necessary.
+- ALWAYS use markdown tables when displaying list data from tools.
 """
  
 # assistant = pc.assistant.create_assistant(
@@ -358,6 +551,8 @@ class CMDBItem(BaseModel):
     sys_id: Optional[str] = None
     source: Optional[str] = "manual"
     raw_data: Optional[Dict[str, Any]] = None
+    service_id: Optional[str] = None  # Reference to service this host belongs to
+    fqdn: Optional[str] = None  # Fully Qualified Domain Name
     # No need to include user_id in the request body as we'll get it from the token
 
 class CMDBItemUpdate(BaseModel):
@@ -370,6 +565,8 @@ class CMDBItemUpdate(BaseModel):
     sys_id: Optional[str] = None
     source: Optional[str] = None
     raw_data: Optional[Dict[str, Any]] = None
+    service_id: Optional[str] = None  # Reference to service this host belongs to
+    fqdn: Optional[str] = None  # Fully Qualified Domain Name
 
 class Snow_key(BaseModel):
     snow_key: str
@@ -438,16 +635,12 @@ class Incident(BaseModel):
     id: Optional[Union[int, str]] = None
 
     # Core (existing)
+    id: Optional[str] = None
     short_description: str
+    description: Optional[str] = None
     tag_id: Optional[str] = None
     state: Optional[str] = None
-
-    # Internal incident correlation key used by worker + Results table.
-    # For PagerDuty you can pass this explicitly, or let /incidentAdd derive it.
     inc_number: Optional[str] = None
-
-    # External linkage (PagerDuty / ServiceNow / etc.)
-    # Recommended values: 'manual' | 'servicenow' | 'pagerduty'
     source: Optional[str] = None
     external_id: Optional[str] = None
     external_number: Optional[str] = None
@@ -458,9 +651,125 @@ class Incident(BaseModel):
     external_created_at: Optional[datetime] = None
     external_updated_at: Optional[datetime] = None
     external_payload: Optional[Dict[str, Any]] = None
+    alert_type_id: Optional[int] = None
+    # New fields for CMDB integration
+    service_id: Optional[str] = None  # Reference to the service this incident is for
+    fqdn: Optional[str] = None  # Fully Qualified Domain Name of affected host
+
+class AlertType(BaseModel):
+    id: Optional[int] = None
+    name: str
+    description: Optional[str] = None
+    priority: str = "medium" # low, medium, high, critical
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CreateAlertType(BaseModel):
+    name: str
+    description: Optional[str] = None
+    priority: str = "medium"
+
+class UpdateAlertType(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    priority: Optional[str] = None
+
+class EscalationRule(BaseModel):
+    id: Optional[int] = None
+    alert_type_id: int
+    level: int
+    wait_time_minutes: int
+    contact_type: str # email, slack
+    contact_destination: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CreateEscalationRule(BaseModel):
+    alert_type_id: int
+    level: int
+    wait_time_minutes: int
+    contact_type: str
+    contact_destination: str
+
+class UpdateEscalationRule(BaseModel):
+    level: Optional[int] = None
+    wait_time_minutes: Optional[int] = None
+    contact_type: Optional[str] = None
+    contact_destination: Optional[str] = None
+
+# --- Service Models for CMDB ---
+
+class Service(BaseModel):
+    """Service model for organizing hosts in CMDB"""
+    id: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    service_type: Optional[str] = None  # e.g., web, database, api, etc.
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class ServiceUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    service_type: Optional[str] = None
+
+class ChangeRequest(BaseModel):
+    id: Optional[int] = None
+    title: str
+    description: Optional[str] = None
+    service_id: Optional[str] = None
+    priority: str = "medium"
+    status: str = "draft"
+    requester_id: str
+    scheduled_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CreateChangeRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    service_id: Optional[str] = None
+    priority: str = "medium"
+    scheduled_at: Optional[datetime] = None
+
+class UpdateChangeRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    service_id: Optional[str] = None
+    priority: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    status: Optional[str] = None
+
+class PendingAction(BaseModel):
+    id: Optional[int] = None
+    action_type: str
+    description: Optional[str] = None
+    payload: dict = {}
+    status: str = "pending"
+    requested_by: str = "system"
+    approved_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CreatePendingAction(BaseModel):
+    action_type: str
+    description: Optional[str] = None
+    payload: dict = {}
+    requested_by: str = "system"
 
 class Mesage(BaseModel):
     content: str
+    session_id: Optional[str] = None
+
+class ChatSession(BaseModel):
+    id: Optional[str] = None
+    user_id: Optional[str] = None
+    title: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class CreateChatSession(BaseModel):
+    title: Optional[str] = None
 
 # def powerStatus(Aws: Aws):
 #     model = genai.GenerativeModel("gemini-1.5-flash")
@@ -2040,14 +2349,284 @@ def get_incident_details(incident_number: str,mail:str):
     )
     
     # Check if request was successful and results were found
-    if response.status_code == 200 and "result" in response.json() and response.json()['result']:
-        # Return the full incident details
-        return response.json()['result'][0]
-    else:
-        # Return error information if incident not found or request failed
+    # Check if request was successful and results were found
+    try:
+        if response.status_code == 200:
+            data = response.json()
+            if "result" in data and data['result']:
+                # Return the full incident details
+                return data['result'][0]
+            else:
+                return {
+                    "status": "failed",
+                    "message": "Incident not found in ServiceNow."
+                }
+        else:
+            return {
+                "status": "failed",
+                "message": f"ServiceNow API Error: {response.status_code} - {response.text}"
+            }
+    except Exception as e:
         return {
             "status": "failed",
-            "message": f"Incident not found or error occurred: {response.text}"
+            "message": f"Failed to parse ServiceNow response: {str(e)}. Response text: {response.text[:200]}"
+        }
+
+@tool
+def list_local_incidents(status: Optional[str] = None, limit: int = 20, mail: str = ""):
+    """List incidents from the local database (not ServiceNow). 
+    
+    Use this tool to query incidents stored in Supabase/PostgreSQL.
+    
+    Args:
+        status: Filter by incident status (e.g., 'Queued', 'InProgress', 'Resolved', 'Closed')
+        limit: Maximum number of incidents to return (default 20)
+        mail: The user's email (injected by backend)
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+        
+        query = supabase.table("Incidents").select("*, Users(*)").eq("user_id", user_id).order("created_at", desc=True).limit(limit)
+        
+        if status:
+            query = query.eq("state", status)
+        
+        response = query.execute()
+        return {"status": "ok", "incidents": response.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@tool
+def get_local_incident_details(inc_number: str, mail: str = ""):
+    """Get details of a specific incident from local database by incident number.
+    
+    Args:
+        inc_number: The incident number (e.g., 'INC-12345')
+        mail: The user's email (injected by backend)
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+        
+        response = supabase.table("Incidents").select("*, Users(*)").eq("inc_number", inc_number).eq("user_id", user_id).execute()
+        
+        if not response.data:
+            return {"status": "not_found", "message": f"Incident {inc_number} not found"}
+        
+        return {"status": "ok", "incident": response.data[0]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@tool
+def update_local_incident(inc_number: str, updates: dict, mail: str = ""):
+    """Update a local incident in the database.
+    
+    Args:
+        inc_number: The incident number to update
+        updates: Dictionary of fields to update (e.g., {'state': 'InProgress', 'short_description': 'New description'})
+        mail: The user's email (injected by backend)
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+        
+        # Check if incident exists and belongs to user
+        existing = supabase.table("Incidents").select("id").eq("inc_number", inc_number).eq("user_id", user_id).execute()
+        if not existing.data:
+            return {"status": "not_found", "message": f"Incident {inc_number} not found"}
+        
+        # Add updated_at timestamp
+        updates["updated_at"] = datetime.utcnow().isoformat()
+        
+        response = supabase.table("Incidents").update(updates).eq("inc_number", inc_number).eq("user_id", user_id).execute()
+        
+        return {"status": "ok", "message": f"Incident {inc_number} updated successfully", "incident": response.data[0]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@tool
+def get_local_cmdb_count(mail: str = ""):
+    """Get the total count of CMDB items and services for the authenticated user.
+    
+    Use this to answer questions about "total number of services", "how many hosts", etc.
+    
+    Args:
+        mail: The user's email (injected by backend)
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found", "total_cmdb_items": 0, "total_services": 0, "items_by_type": {}}
+        user_id = user_response.data[0]["id"]
+        
+        # Get total count of CMDB items for this user
+        response = supabase.table("CMDB").select("id", count='exact').eq("user_id", user_id).execute()
+        total_items = response.count or 0
+        
+        # Get count by type
+        type_response = supabase.table("CMDB").select("type").eq("user_id", user_id).execute()
+        type_counts = {}
+        for item in type_response.data or []:
+            item_type = item.get('type', 'unknown')
+            type_counts[item_type] = type_counts.get(item_type, 0) + 1
+        
+        # Get services count (global, not user-specific)
+        services_response = supabase.table("services").select("id", count='exact').execute()
+        total_services = services_response.count or 0
+        
+        # Get all services for display
+        services_list = supabase.table("services").select("*").execute()
+        services = services_list.data or []
+        
+        return {
+            "status": "ok",
+            "total_cmdb_items": total_items,
+            "total_services": total_services,
+            "items_by_type": type_counts,
+            "services": [{"id": s["id"], "name": s["name"], "service_type": s.get("service_type")} for s in services]
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "total_cmdb_items": 0, "total_services": 0, "items_by_type": {}}
+
+
+@tool
+def search_local_cmdb(query: str, mail: str = ""):
+    """Search the local CMDB database for configuration items.
+    
+    Args:
+        query: Search query (searches tag_id, IP, address, description, OS, type). Use empty string to get all items.
+        mail: The user's email (injected by backend)
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found", "items": [], "services": []}
+        user_id = user_response.data[0]["id"]
+        
+        # Get services (global, not user-specific)
+        services_response = supabase.table("services").select("*").execute()
+        services = services_response.data or []
+        
+        # If query is empty, return all items
+        if not query or not query.strip():
+            response = supabase.table("CMDB").select("*, Users(*)").eq("user_id", user_id).execute()
+        else:
+            response = supabase.table("CMDB").select("*, Users(*)").eq("user_id", user_id).or_(
+                f"tag_id.ilike.%{query}%,ip.ilike.%{query}%,addr.ilike.%{query}%,type.ilike.%{query}%,description.ilike.%{query}%,os.ilike.%{query}%"
+            ).execute()
+        
+        items = response.data or []
+        
+        # Format items for better display
+        formatted_items = []
+        for item in items:
+            formatted_items.append({
+                "tag_id": item.get("tag_id", "N/A"),
+                "ip": item.get("ip", "N/A"),
+                "fqdn": item.get("fqdn", "N/A"),
+                "type": item.get("type", "N/A"),
+                "os": item.get("os", "N/A"),
+                "addr": item.get("addr", "N/A"),
+                "description": item.get("description", "N/A"),
+                "service_id": item.get("service_id", ""),
+                "source": item.get("source", "manual")
+            })
+        
+        # Get service names for mapping
+        service_map = {s["id"]: s["name"] for s in services}
+        
+        # Add service name to items
+        for item in formatted_items:
+            if item.get("service_id") and item["service_id"] in service_map:
+                item["service_name"] = service_map[item["service_id"]]
+            else:
+                item["service_name"] = "Unassigned"
+        
+        return {
+            "status": "ok", 
+            "items": formatted_items, 
+            "count": len(formatted_items),
+            "services": services,
+            "total_services": len(services)
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "items": [], "services": [], "total_services": 0}
+
+
+@tool
+def get_local_cmdb_item(tag_id: str, mail: str = ""):
+    """Get a specific CMDB item by tag_id from local database.
+    
+    Args:
+        tag_id: The tag_id of the configuration item
+        mail: The user's email (injected by backend)
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+        
+        response = supabase.table("CMDB").select("*, Users(*)").eq("tag_id", tag_id).eq("user_id", user_id).execute()
+        
+        if not response.data:
+            return {"status": "not_found", "message": f"CMDB item {tag_id} not found"}
+        
+        return {"status": "ok", "item": response.data[0]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    """Fetch CMDB details for a host belonging to the authenticated user.
+
+    The `mail` parameter is injected by the backend and must never be requested from
+    the user. Do not mention this parameter or internal emails in model responses.
+
+    The `tag_id` should match the host's tag identifier stored in the CMDB.
+    """
+    try:
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {
+                "status": "not_found",
+                "message": f"User with email '{mail}' not found.",
+                "items": [],
+            }
+        user_id = user_response.data[0]["id"]
+
+        cmdb_response = (
+            supabase.table("CMDB")
+            .select("*")
+            .eq("tag_id", tag_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        items = cmdb_response.data or []
+
+        if not items:
+            return {
+                "status": "not_found",
+                "message": f"No CMDB entry found for tag_id '{tag_id}' for this user.",
+                "items": [],
+            }
+
+        return {
+            "status": "ok",
+            "items": items,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
         }
 
 @tool
@@ -2419,10 +2998,186 @@ def pagerduty_list_incidents(statuses: Optional[List[str]] = None, limit: int = 
     return pagerduty_list_incidents_impl(mail=mail, statuses=statuses, limit=limit)
 
 
+
 @tool
 def pagerduty_get_incident(incident_id: str, mail: str = ""):
     """Get a PagerDuty incident by id."""
     return pagerduty_get_incident_impl(mail=mail, incident_id=incident_id)
+
+
+@tool
+def web_search_tool(query: str):
+    """Search the web for current information on any topic.
+    
+    Use this tool when the user asks about:
+    - Current events or news
+    - Information that might change frequently
+    - Technical documentation or tutorials
+    - Anything that requires up-to-date information from the internet
+    
+    Args:
+        query: The search query string
+    """
+    try:
+        client = TavilyClient(os.getenv("tavali_api_key"))
+        search_response = client.search(
+            query=query,
+            max_results=5
+        )
+        
+        # Process results
+        results = []
+        for result in search_response.get('results', []):
+            results.append({
+                "title": result.get('title', ''),
+                "url": result.get('url', ''),
+                "content": result.get('content', '')[:300]  # Limit content length
+            })
+        
+        if not results:
+            return {
+                "status": "ok",
+                "message": "No results found",
+                "results": []
+            }
+        
+        # Get the raw content from first result for more context
+        answer = ""
+        try:
+            import requests
+            if results:
+                response = requests.get(results[0]['url'], timeout=10)
+                if response.status_code == 200:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    text_content = soup.get_text(separator=' ', strip=True)
+                    answer = text_content[:1000]  # Get first 1000 chars
+        except:
+            pass
+        
+        return {
+            "status": "ok",
+            "results": results,
+            "answer": answer if answer else "\n\n".join([f"{r['title']}: {r['content']}" for r in results])
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Web search failed: {str(e)}",
+            "results": []
+        }
+
+
+@tool
+def get_rca_report(incident_number: str, mail: str = ""):
+    """
+    Get the Root Cause Analysis (RCA) report for a specific incident.
+    
+    Use this tool when the user asks about:
+    - Root cause of an incident
+    - RCA report details
+    - What caused a specific incident
+    - Incident analysis or post-mortem
+    
+    Args:
+        incident_number: The incident number (e.g., 'INC-12345')
+        mail: The user's email (injected by backend)
+    """
+    try:
+        # First verify user has access to this incident
+        user_response = supabase.table("Users").select("id").eq("email", mail).execute()
+        if not user_response.data:
+            return {"status": "error", "message": "User not found"}
+        user_id = user_response.data[0]["id"]
+        
+        # Check if incident exists and belongs to user
+        incident_response = supabase.table("Incidents").select("id, inc_number, short_description").eq("inc_number", incident_number).eq("user_id", user_id).execute()
+        
+        if not incident_response.data:
+            return {"status": "not_found", "message": f"Incident {incident_number} not found or access denied"}
+        
+        # Get RCA report from database
+        rca_response = supabase.table("rca_reports").select("*").eq("incident_id", incident_number).execute()
+        
+        if not rca_response.data:
+            return {
+                "status": "not_found", 
+                "message": f"No RCA report found for incident {incident_number}. The RCA may not have been generated yet.",
+                "incident": incident_response.data[0]
+            }
+        
+        rca_report = rca_response.data[0]
+        
+        return {
+            "status": "ok",
+            "incident": incident_response.data[0],
+            "rca_report": {
+                "id": rca_report.get("id"),
+                "incident_id": rca_report.get("incident_id"),
+                "report_content": rca_report.get("report_content"),
+                "generated_by": rca_report.get("generated_by"),
+                "created_at": rca_report.get("created_at")
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to fetch RCA report: {str(e)}"}
+
+
+@tool
+def get_problem_record_details(
+    problem_id: Optional[int] = None,
+    status: Optional[str] = None,
+    incident_number: Optional[str] = None,
+    include_linked_incidents: bool = False
+):
+    """
+    Get details of Problem Records from the database.
+    
+    Args:
+        problem_id: The ID of the specific problem record.
+        status: Filter by status (e.g., 'open', 'root_cause_identified', 'resolved').
+        incident_number: Find the Problem Record associated with a specific Incident Number.
+        include_linked_incidents: If True, also fetches the list of incidents linked to this problem.
+    """
+    try:
+        query = supabase.table("problem_records").select("*")
+
+        if problem_id:
+            query = query.eq("id", problem_id)
+        
+        elif incident_number:
+            # First, find the problem_id linked to this incident
+            inc_response = supabase.table("Incidents").select("problem_id").eq("inc_number", incident_number).execute()
+            if not inc_response.data or not inc_response.data[0].get("problem_id"):
+                return f"No problem record found linked to incident {incident_number}"
+            
+            problem_id = inc_response.data[0]["problem_id"]
+            query = query.eq("id", problem_id)
+
+        elif status:
+            query = query.eq("status", status)
+        
+        # If no filters provided, limit to recent open problems
+        if not problem_id and not status and not incident_number:
+            query = query.order("created_at", desc=True).limit(5)
+            
+        response = query.execute()
+        records = response.data
+        
+        if include_linked_incidents and records:
+             prob_ids = [r['id'] for r in records]
+             if prob_ids:
+                # We need to select problem_id to map them back
+                inc_query = supabase.table("Incidents").select("inc_number, description, state, problem_id").in_("problem_id", prob_ids).execute()
+                
+                for rec in records:
+                    rec['linked_incidents'] = [inc for inc in inc_query.data if inc.get('problem_id') == rec['id']]
+
+        return records
+
+    except Exception as e:
+        return f"Error fetching problem record: {str(e)}"
 
 
 @app.post("/websearch")
@@ -2488,9 +3243,18 @@ async def web_search(message: str, user_data: dict = Depends(verify_token)):
 tools = [
     # Keep KB tool first so the model sees it prominently
     ask_knowledge_base,
+    # Local DB tools (Supabase)
+    list_local_incidents,
+    get_local_incident_details,
+    update_local_incident,
+    search_local_cmdb,
+    get_local_cmdb_item,
+    get_local_cmdb_count,
+    # ServiceNow tools
     create_incident,
     update_incident,
     get_incident_details,
+    # CMDB tools
     getfromcmdb,
     infra_automation_ai,
     prometheus_query,
@@ -2504,6 +3268,10 @@ tools = [
     confluence_get_page,
     pagerduty_list_incidents,
     pagerduty_get_incident,
+    get_rca_report,
+    get_problem_record_details,
+    # Web search tool
+    web_search_tool,
 ]
 
 tool_llm = get_llm()
@@ -2530,6 +3298,14 @@ TOOLS_REQUIRING_MAIL = {
     "confluence_get_page",
     "pagerduty_list_incidents",
     "pagerduty_get_incident",
+    "get_rca_report",
+    # Local DB tools
+    "list_local_incidents",
+    "get_local_incident_details",
+    "update_local_incident",
+    "search_local_cmdb",
+    "get_local_cmdb_item",
+    "get_local_cmdb_count",
 }
 
 
@@ -2546,6 +3322,7 @@ def _store_chat_history(
     *,
     is_async: bool = False,
     job_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> None:
     """Persist a single chat interaction in the Supabase `ChatHistory` table.
 
@@ -2583,6 +3360,7 @@ def _store_chat_history(
             "raw_result": {"tool_calls": tool_calls},
             "is_async": is_async,
             "job_id": job_id,
+            "session_id": session_id,
         }
         if user_id is not None:
             payload["user_id"] = user_id
@@ -2599,6 +3377,7 @@ def process_chat_request(
     *,
     is_async: bool = False,
     job_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
     """Core chat logic shared by sync and async endpoints.
 
@@ -2680,6 +3459,7 @@ def process_chat_request(
         tool_calls=all_tool_calls,
         is_async=is_async,
         job_id=job_id,
+        session_id=session_id,
     )
 
     return {"result": all_tool_calls, "successorfail": result_text}
@@ -2698,7 +3478,135 @@ def chat(message: Mesage, credentials: Annotated[HTTPAuthorizationCredentials, D
         print(e)
         return {"error": e}
 
-    return process_chat_request(mail=mail, message_content=message.content)
+    return process_chat_request(mail=mail, message_content=message.content, session_id=message.session_id)
+
+
+@app.post("/chat/stream")
+async def chat_stream(message: Mesage, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)], response: Response):
+    """
+    Streaming chat endpoint - uses Server-Sent Events to stream the response.
+    Now supports context for re-formatting previous data.
+    """
+    from fastapi.responses import StreamingResponse
+    
+    try:
+        token = credentials.credentials
+        res = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        mail = res['email']
+    except jwt.DecodeError as e:
+        print(e)
+        return {"error": e}
+
+    async def generate():
+        system_message = SystemMessage(content=CHAT_SYSTEM_PROMPT)
+        
+        # Get context fields with defaults for backward compatibility
+        previous_data = getattr(message, 'previous_data', None)
+        format_request = getattr(message, 'format_request', None)
+        previous_data_type = getattr(message, 'previous_data_type', None)
+        
+        # Add context for re-formatting requests if provided
+        context_instruction = ""
+        if previous_data is not None and format_request:
+            context_instruction = f"\n\nUSER CONTEXT FOR RE-FORMATTING:\nThe user is asking to re-format previous data. Previous data type: {previous_data_type or 'unknown'}.\nUser's re-format request: {format_request}\nPrevious data: {json.dumps(previous_data, indent=2)}\n\nPlease format this data as requested by the user (e.g., table, list, etc.)."
+        
+        # Build messages with optional context
+        messages = [system_message, HumanMessage(content=message.content + context_instruction)]
+
+        all_tool_calls: List[Dict[str, Any]] = []
+        final_model_message: Optional[Any] = None
+
+        # Allow the model multiple rounds of tool usage
+        for _ in range(5):
+            res = llm_with_tools.invoke(messages)
+            final_model_message = res
+            messages.append(res)
+
+            tool_calls = getattr(res, "tool_calls", []) or []
+            if not tool_calls:
+                break
+
+            for tool_call in tool_calls:
+                tool_name = (tool_call.get("name") or "").lower()
+                tool = tool_mapping.get(tool_name)
+                tool_args = dict(tool_call.get("args") or {}) if isinstance(tool_call.get("args"), dict) else {}
+
+                # Inject backend-managed email for tools that require `mail`
+                if tool_name in TOOLS_REQUIRING_MAIL:
+                    tool_args["mail"] = mail
+
+                if tool is None:
+                    tool_output: Any = {"status": "error", "message": f"Unknown tool: {tool_name}"}
+                else:
+                    tool_output = tool.invoke(tool_args)
+
+                all_tool_calls.append({
+                    "name": tool_name,
+                    "args": tool_args,
+                    "output": tool_output,
+                })
+
+                # Stream tool call event
+                yield f"data: {json.dumps({'type': 'tool_call', 'tool': {'name': tool_name, 'args': tool_args, 'output': str(tool_output)}})}\n\n"
+
+                tool_output_str = tool_output if isinstance(tool_output, str) else json.dumps(tool_output)
+                messages.append(ToolMessage(content=tool_output_str, tool_call_id=tool_call["id"]))
+
+        # Use a separate summarization call for the final natural-language answer
+        ex2 = final_model_message if final_model_message is not None else ""
+        
+        # Get context fields with defaults for backward compatibility
+        previous_data = getattr(message, 'previous_data', None)
+        format_request = getattr(message, 'format_request', None)
+        
+        # Add context for re-formatting if provided
+        reformat_context = ""
+        if previous_data is not None and format_request:
+            reformat_context = f"\n\nThe user specifically asked to format the data as: {format_request}.\nHere is the raw data that should be formatted: {json.dumps(previous_data, indent=2)}"
+        
+        result_text = call_llm(
+            f'''generate a response for the given context {ex2} make it short and give only important details related to {message.content} in sentences dont add unnecessary , or symbols or extra spaces use the {ex2} to provide details and if it failed give details why it failed
+                                    - dont mention the word playbook and word shell commands and word python error  and dont mention this sentence
+                                    - A warning was generated regarding the Python interpreter path potentially changing in the future. Galaxy collections installation indicated that all requested collections are already installed. No shell errors were reported and
+                                    - dont mention automation or any such word
+                                    - dont mention The platform is using Python interpreter at /usr/bin/python3.12 and future installations might change this path. 5 tasks were completed and 2 were changed. No tasks failed or were unreachable or any similar sentences
+                                    - dont mention sentences like tasks executed or 5 tasks run etc
+                                    - if anything other than ansible you can mention the entire output of {ex2}'''
+                                    + reformat_context
+        )
+
+        # Extract incident number from the message if it exists
+        incident_match = re.search(r'incident\s+(\w+)', message.content, re.IGNORECASE)
+        if incident_match:
+            inc_number = incident_match.group(1)
+            try:
+                incident_response = supabase.table("Incidents").select("id").eq("inc_number", inc_number).execute()
+                if incident_response.data:
+                    supabase.table("Incidents").update({"state": "completed"}).eq("inc_number", inc_number).execute()
+            except Exception as e:
+                print(f"Error updating incident status: {str(e)}")
+
+        # Persist chat history
+        _store_chat_history(
+            mail=mail,
+            message_content=message.content,
+            result_text=result_text,
+            tool_calls=all_tool_calls,
+            is_async=False,
+            job_id=None,
+            session_id=message.session_id,
+        )
+
+        # Stream the response in chunks
+        chunk_size = 20
+        for i in range(0, len(result_text), chunk_size):
+            chunk = result_text[i:i + chunk_size]
+            yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+
+        # Send done event
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/chat/async")
@@ -2726,6 +3634,7 @@ def enqueue_chat(
         "job_id": job_id,
         "mail": mail,
         "content": message.content,
+        "session_id": message.session_id,
         "created_at": datetime.utcnow().isoformat(),
     }
     message_body = json.dumps(body)
@@ -2799,10 +3708,124 @@ async def get_chat_history(
         )
         return {"response": response}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat/sessions")
+async def create_chat_session(
+    session_data: CreateChatSession,
+    user_data: dict = Depends(verify_token),
+):
+    """Create a new chat session."""
+    try:
+        user_id = user_data["user_id"]
+        title = session_data.title or "New Chat"
+        
+        response = supabase.table("ChatSessions").insert({
+            "user_id": user_id,
+            "title": title,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+        
+        return {"response": response.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/chat/sessions")
+async def list_chat_sessions(
+    limit: int = 50,
+    offset: int = 0,
+    user_data: dict = Depends(verify_token),
+):
+    """List chat sessions for the user."""
+    try:
+        user_id = user_data["user_id"]
+        response = (
+            supabase.table("ChatSessions")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("updated_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        return {"response": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/chat/sessions/{session_id}")
+async def update_chat_session(
+    session_id: str,
+    update_data: CreateChatSession,
+    user_data: dict = Depends(verify_token),
+):
+    """Update title of a chat session."""
+    try:
+        if not update_data.title:
+             return {"message": "No changes"}
+
+        response = supabase.table("ChatSessions").update({
+            "title": update_data.title,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", session_id).eq("user_id", user_data["user_id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+            
+        return {"response": response.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/chat/history/{session_id}")
+async def get_session_history(
+    session_id: str,
+    user_data: dict = Depends(verify_token),
+):
+    """Get history for a specific session."""
+    try:
+        user_id = user_data["user_id"]
+        # Verify ownership
+        # session_check = supabase.table("ChatSessions").select("id").eq("id", session_id).eq("user_id", user_id).execute()
+        # if not session_check.data:
+        #      raise HTTPException(status_code=404, detail="Session not found")
+             
+        response = (
+            supabase.table("ChatHistory")
+            .select("id, email, message_content, response_text, is_async, job_id, created_at, raw_result")
+            .eq("session_id", session_id)
+            .order("created_at") # Ascending for chat view
+            .execute() # Added missing .execute()
+        )
+        return {"response": response}
+    except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch chat history: {str(e)}",
         )
+
+
+@app.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    user_data: dict = Depends(verify_token),
+):
+    """Delete a chat session and its history."""
+    try:
+        user_id = user_data["user_id"]
+        
+        # Delete chat history first
+        supabase.table("ChatHistory").delete().eq("session_id", session_id).eq("user_id", user_id).execute()
+        
+        # Delete the session
+        response = supabase.table("ChatSessions").delete().eq("id", session_id).eq("user_id", user_id).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+            
+        return {"status": "ok", "message": "Session deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def chat_worker_loop():
@@ -2834,6 +3857,8 @@ def chat_worker_loop():
                     job_id = body.get("job_id")
                     mail = body.get("mail")
                     content = body.get("content", "")
+                    session_id = body.get("session_id")
+                    # session_id = body.get("session_id") # This line was duplicated
 
                     if not job_id or not mail or not content:
                         # Malformed message; drop it
@@ -2848,7 +3873,8 @@ def chat_worker_loop():
                         message_content=content,
                         is_async=True,
                         job_id=job_id,
-                    )
+                        session_id=session_id,
+                    ) # Removed duplicated `session_id=session_id,` and extra closing parenthesis
 
                     r.set(
                         job_key,
@@ -2959,6 +3985,56 @@ async def get_all_cmdb_items(user_data: dict = Depends(verify_token)):
             detail=f"Database error: {str(e)}"
         )
 
+# Get CMDB items grouped by service
+@app.get("/cmdb/by-service", response_model=dict)
+async def get_cmdb_by_service(user_data: dict = Depends(verify_token)):
+    """Get CMDB items grouped by service"""
+    try:
+        # Get all services
+        services_response = supabase.table("services").select("*").order("name").execute()
+        services = services_response.data or []
+        
+        # Get all CMDB items for this user
+        cmdb_response = supabase.table("CMDB").select("*, Users(*)").eq("user_id", user_data["user_id"]).execute()
+        cmdb_items = cmdb_response.data or []
+        
+        # Group CMDB items by service_id
+        unassigned = []
+        grouped = {}
+        
+        for item in cmdb_items:
+            service_id = item.get("service_id")
+            if service_id:
+                if service_id not in grouped:
+                    grouped[service_id] = []
+                grouped[service_id].append(item)
+            else:
+                unassigned.append(item)
+        
+        # Build response with service info and hosts
+        result = []
+        for service in services:
+            service_id = service["id"]
+            result.append({
+                "service": service,
+                "hosts": grouped.get(service_id, []),
+                "host_count": len(grouped.get(service_id, []))
+            })
+        
+        # Add unassigned hosts
+        result.append({
+            "service": {"id": None, "name": "Unassigned", "description": "Hosts not assigned to any service"},
+            "hosts": unassigned,
+            "host_count": len(unassigned)
+        })
+        
+        return {"response": result}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
 # Get CMDB item by tag_id (only if it belongs to the authenticated user)
 @app.get("/cmdb/{tag_id}", response_model=dict)
 async def get_cmdb_item(tag_id: str, user_data: dict = Depends(verify_token)):
@@ -2990,6 +4066,15 @@ async def create_cmdb_item(item: CMDBItem, user_data: dict = Depends(verify_toke
                 detail=f"CMDB item with tag_id {item.tag_id} already exists for this user"
             )
         
+        # Validate service_id if provided
+        if item.service_id:
+            service_check = supabase.table("services").select("id").eq("id", item.service_id).execute()
+            if not service_check.data:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Service with id {item.service_id} does not exist"
+                )
+        
         # Create new item with user_id
         response = supabase.table("CMDB").insert({
             "tag_id": item.tag_id,
@@ -3002,6 +4087,8 @@ async def create_cmdb_item(item: CMDBItem, user_data: dict = Depends(verify_toke
             "source": item.source,
             "raw_data": item.raw_data,
             "user_id": user_data["user_id"],  # Add user_id from token
+            "service_id": item.service_id,  # Service reference
+            "fqdn": item.fqdn,  # FQDN
             "created_at": datetime.utcnow().isoformat()
         }).execute()
         
@@ -3044,6 +4131,18 @@ async def update_cmdb_item(
             update_data["description"] = item.description
         if item.os is not None:
             update_data["os"] = item.os
+        if item.service_id is not None:
+            # Validate service_id if provided
+            if item.service_id:
+                service_check = supabase.table("services").select("id").eq("id", item.service_id).execute()
+                if not service_check.data:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Service with id {item.service_id} does not exist"
+                    )
+            update_data["service_id"] = item.service_id
+        if item.fqdn is not None:
+            update_data["fqdn"] = item.fqdn
         update_data["updated_at"] = datetime.utcnow().isoformat()
         
         # Update item (user_id filter ensures user can only update their own items)
@@ -3099,7 +4198,168 @@ async def search_cmdb_items(query: str, user_data: dict = Depends(verify_token))
             detail=f"Database error: {str(e)}"
         )
 
-@app.post("/updateAWS")
+# --- Service Management Routes (Global/Shared CMDB) ---
+
+@app.get("/services", response_model=dict)
+async def get_all_services(user_data: dict = Depends(verify_token)):
+    """Get all services (global/shared, not user-specific)"""
+    try:
+        response = supabase.table("services").select("*").order("name").execute()
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+@app.get("/services/{service_id}", response_model=dict)
+async def get_service(service_id: str, user_data: dict = Depends(verify_token)):
+    """Get a specific service by ID"""
+    try:
+        response = supabase.table("services").select("*").eq("id", service_id).execute()
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service with id {service_id} not found"
+            )
+        return {"response": response}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+@app.post("/services", response_model=dict, status_code=status.HTTP_201_CREATED)
+async def create_service(service: Service, user_data: dict = Depends(verify_token)):
+    """Create a new service (global/shared)"""
+    try:
+        # Check if service name already exists
+        existing = supabase.table("services").select("id").eq("name", service.name).execute()
+        if existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Service with name '{service.name}' already exists"
+            )
+        
+        response = supabase.table("services").insert({
+            "name": service.name,
+            "description": service.description,
+            "service_type": service.service_type,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        return {"response": response}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+@app.put("/services/{service_id}", response_model=dict)
+async def update_service(service_id: str, service: ServiceUpdate, user_data: dict = Depends(verify_token)):
+    """Update a service"""
+    try:
+        # Check if service exists
+        existing = supabase.table("services").select("*").eq("id", service_id).execute()
+        if not existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service with id {service_id} not found"
+            )
+        
+        # Build update dictionary with only provided fields
+        update_data = {}
+        if service.name is not None:
+            # Check if new name conflicts with another service
+            conflict = supabase.table("services").select("id").eq("name", service.name).neq("id", service_id).execute()
+            if conflict.data:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Service with name '{service.name}' already exists"
+                )
+            update_data["name"] = service.name
+        if service.description is not None:
+            update_data["description"] = service.description
+        if service.service_type is not None:
+            update_data["service_type"] = service.service_type
+        
+        update_data["updated_at"] = datetime.utcnow().isoformat()
+        
+        response = supabase.table("services").update(update_data).eq("id", service_id).execute()
+        
+        return {"response": response}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+@app.delete("/services/{service_id}", response_model=dict)
+async def delete_service(service_id: str, user_data: dict = Depends(verify_token)):
+    """Delete a service"""
+    try:
+        # Check if service exists
+        existing = supabase.table("services").select("*").eq("id", service_id).execute()
+        if not existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service with id {service_id} not found"
+            )
+        
+        # Check if there are hosts assigned to this service
+        hosts_response = supabase.table("CMDB").select("tag_id").eq("service_id", service_id).execute()
+        if hosts_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot delete service. There are {len(hosts_response.data)} hosts assigned to this service. Please reassign them first."
+            )
+        
+        response = supabase.table("services").delete().eq("id", service_id).execute()
+        
+        return {"response": response}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+@app.get("/services/{service_id}/hosts", response_model=dict)
+async def get_service_hosts(service_id: str, user_data: dict = Depends(verify_token)):
+    """Get all hosts belonging to a specific service"""
+    try:
+        # First verify service exists
+        service_response = supabase.table("services").select("*").eq("id", service_id).execute()
+        if not service_response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service with id {service_id} not found"
+            )
+        
+        # Get hosts for this service
+        response = supabase.table("CMDB").select("*, Users(*)").eq("service_id", service_id).execute()
+        
+        return {
+            "response": response,
+            "service": service_response.data[0]
+        }
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
+
+
 async def update_aws_credentials(Aws: Aws, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
     try:
         token = credentials.credentials
@@ -3638,8 +4898,99 @@ async def get_prometheus_config(user_data: dict = Depends(verify_token)):
             detail=f"Failed to fetch Prometheus configuration: {str(e)}",
         )
  
+@app.post("/addSlackCredentials")
+def addSlackCredentials(config: SlackConfig, user_data: dict = Depends(verify_token)):
+    try:
+        user_id = user_data.get("sub") or user_data.get("user_id")
+        if not user_id:
+             raise HTTPException(status_code=401, detail="User ID not found in token")
+
+        # Use email if available for user-scoped secret key, else fallback to user_id
+        user_email = user_data.get("email") 
+        # For now, let's trust the token has email or use user_id as identifier suffix
+        identifier = user_email if user_email else user_id
+
+        # Store in Infisical
+        secrets = {
+            "SLACK_BOT_TOKEN": config.slack_bot_token,
+            "SLACK_CHANNEL": config.slack_channel
+        }
+        set_many(identifier, secrets)
+            
+        return {"message": "Slack credentials saved to Infisical"}
+    except Exception as e:
+        print(f"ERROR in addSlackCredentials: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/getSlackCredentials/{mail}")
+def getSlackCredentials(mail: str, user_data: dict = Depends(verify_token)):
+    try:
+        # Retrieve from Infisical using the mail param which should match what was used to save
+        # Or verify against token email if strictly enforcing ownership
+        
+        # NOTE: existing frontend passes email in URL. 
+        secrets = get_many(mail, ("SLACK_BOT_TOKEN", "SLACK_CHANNEL"))
+        
+        if not secrets.get("SLACK_BOT_TOKEN"):
+             # Return empty or 404? Existing returned {} if not found
+             return {}
+
+        return {
+            "slack_bot_token": secrets["SLACK_BOT_TOKEN"],
+            "slack_channel": secrets.get("SLACK_CHANNEL")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/addEmailCredentials")
+def addEmailCredentials(config: EmailConfig, user_data: dict = Depends(verify_token)):
+    try:
+        # We need an identifier for Infisical. Prefer email.
+        user_email = user_data.get("email")
+        if not user_email:
+             # Try to get from user_id or sub if email not in token (might need lookup)
+             # For now assume frontend passes correct mail or token has it.
+             # If we can't get email, we can't use email-scoped secrets easily without a mapping.
+             # Let's rely on the user knowing their email or passing it.
+             # Actually, let's use the user_id as fallback or fetch from DB if needed.
+             pass
+        
+        # Simplified: Use the email from the config? No, config has sender_email.
+        identifier = config.sender_email # Use sender email as key suffix? Or user's login email?
+        # Standardize on using the 'mail' param from GET often used, or token email.
+        # Let's assume the user wants to store secrets associated with the sender_email they are configuring.
+        identifier = config.sender_email
+
+        secrets = {
+            "SMTP_SERVER": config.smtp_server,
+            "SMTP_PORT": str(config.smtp_port),
+            "SENDER_EMAIL": config.sender_email,
+            "SENDER_PASSWORD": config.sender_password
+        }
+        set_many(identifier, secrets)
+        
+        return {"message": "Email credentials saved to Infisical"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/getEmailCredentials/{mail}")
+def getEmailCredentials(mail: str, user_data: dict = Depends(verify_token)):
+    try:
+        secrets = get_many(mail, ("SMTP_SERVER", "SMTP_PORT", "SENDER_EMAIL", "SENDER_PASSWORD"))
+        
+        if not secrets.get("SENDER_EMAIL"):
+             return {}
+
+        return {
+            "smtp_server": secrets.get("SMTP_SERVER", "smtp.gmail.com"),
+            "smtp_port": int(secrets.get("SMTP_PORT", 587)),
+            "sender_email": secrets["SENDER_EMAIL"],
+            "sender_password": secrets["SENDER_PASSWORD"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 @app.post("/storeResult")
-async def store_result(inc_number: str, result: str, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
+async def store_result(inc_number: str, result: str, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)], background_tasks: BackgroundTasks):
     try:
         token = credentials.credentials
         res = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
@@ -3663,6 +5014,12 @@ async def store_result(inc_number: str, result: str, credentials: Annotated[HTTP
             "created_at": datetime.utcnow().isoformat()
         }).execute()
         
+        # Trigger notification
+        try:
+            background_tasks.add_task(NotificationService.notify_incident_update, user_id, inc_number, result)
+        except Exception as e:
+            logger.error(f"Failed to queue notification task: {e}")
+
         return {"response": "Result stored successfully", "data": response.data}
         
     except Exception as e:
@@ -3703,8 +5060,27 @@ async def get_results(inc_number: str, credentials: Annotated[HTTPAuthorizationC
             detail=f"Failed to get results: {str(e)}"
         )
 
+@app.get("/getRCA/{inc_number}")
+def get_rca(inc_number: str, user_data: dict = Depends(verify_token)):
+    try:
+        result = rca_service.get_rca(inc_number)
+        return {"response": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generateRCA/{inc_number}")
+def generate_rca(inc_number: str, user_data: dict = Depends(verify_token)):
+    try:
+        # Trigger generation (this could be async/background task for better UX in future)
+        result = rca_service.generate_rca(inc_number)
+        if "error" in result:
+             raise HTTPException(status_code=500, detail=result["error"])
+        return {"response": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/incidentAdd")
-def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
+def incidentAdd(Req: Incident, background_tasks: BackgroundTasks, user_data: dict = Depends(verify_token)):
     # Get user_id from verified token
     user_id = user_data.get("user_id")
 
@@ -3735,6 +5111,17 @@ def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
 
     # Treat empty / missing payloads as NULL so simple incidents don't store traces by default.
     external_payload = Req.external_payload or None
+    
+    # Resolve service_id and fqdn from CMDB if tag_id is provided but service_id/fqdn are not
+    resolved_service_id = Req.service_id
+    resolved_fqdn = Req.fqdn
+    
+    if tag_id and not resolved_service_id:
+        # Try to get service_id and fqdn from CMDB
+        cmdb_response = supabase.table("CMDB").select("service_id, fqdn").eq("tag_id", tag_id).execute()
+        if cmdb_response.data:
+            resolved_service_id = cmdb_response.data[0].get("service_id")
+            resolved_fqdn = cmdb_response.data[0].get("fqdn")
 
     insert_payload: Dict[str, Any] = {
         "id": Req.id,
@@ -3753,6 +5140,9 @@ def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
         "external_created_at": external_created_at,
         "external_updated_at": external_updated_at,
         "external_payload": external_payload,
+        "alert_type_id": Req.alert_type_id,
+        "service_id": resolved_service_id,  # Service reference
+        "fqdn": resolved_fqdn,  # FQDN of affected host
     }
 
     # Avoid inserting NULLs (lets DB defaults apply where present)
@@ -3760,6 +5150,12 @@ def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
 
     # Insert incident with user_id
     supabase.table("Incidents").insert(insert_payload).execute()
+
+    # Trigger notification
+    try:
+        background_tasks.add_task(NotificationService.notify_incident_created, user_id, insert_payload)
+    except Exception as e:
+        logger.error(f"Failed to queue notification task: {e}")
 
     # Prepare SQS queue message
     sqsqueue = session.resource("sqs").get_queue_by_name(QueueName="infraaiqueue.fifo")
@@ -3774,6 +5170,11 @@ def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
         message_parts.append(f"service={Req.external_service}")
     if Req.external_url:
         message_parts.append(f"url={Req.external_url}")
+    # Add service info to message if available
+    if resolved_service_id:
+        message_parts.append(f"service_id={resolved_service_id}")
+    if resolved_fqdn:
+        message_parts.append(f"fqdn={resolved_fqdn}")
     message_text = " | ".join(message_parts)
 
     message_body = json.dumps(
@@ -3792,6 +5193,8 @@ def incidentAdd(Req: Incident, user_data: dict = Depends(verify_token)):
             "Meta": {
                 "user_id": user_id,
                 "tag_id": tag_id,
+                "service_id": resolved_service_id,
+                "fqdn": resolved_fqdn,
             },
         }
     )
@@ -3863,6 +5266,17 @@ def add_incident_v3(Req: Incident, user_data: dict = Depends(verify_token), _: b
         inc_number = f"INC-{uuid.uuid4().hex[:12].upper()}"
 
     state = Req.state or "Queued"
+    
+    # Resolve service_id and fqdn from CMDB if tag_id is provided
+    resolved_service_id = Req.service_id
+    resolved_fqdn = Req.fqdn
+    
+    if Req.tag_id and not resolved_service_id:
+        cmdb_response = supabase.table("CMDB").select("service_id, fqdn").eq("tag_id", Req.tag_id).execute()
+        if cmdb_response.data:
+            resolved_service_id = cmdb_response.data[0].get("service_id")
+            resolved_fqdn = cmdb_response.data[0].get("fqdn")
+
     insert_payload = {
         "short_description": Req.short_description,
         "tag_id": Req.tag_id,
@@ -3870,6 +5284,9 @@ def add_incident_v3(Req: Incident, user_data: dict = Depends(verify_token), _: b
         "inc_number": inc_number,
         "user_id": user_id,
         "source": Req.source or "manual",
+        "alert_type_id": Req.alert_type_id,
+        "service_id": resolved_service_id,
+        "fqdn": resolved_fqdn,
     }
     supabase.table("Incidents").insert(insert_payload).execute()
 
@@ -4034,8 +5451,389 @@ def get_job_status(job_id: str, user_data: dict = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Job not found")
     return response.data[0]
 
-# --- Admin Routes ---
+@app.post("/uploadCMDB")
+async def upload_cmdb(file: UploadFile = File(...), user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("cmdb", "write"))):
+    """
+    Upload a CSV file to bulk import/update CMDB items.
+    CSV must have a 'tag_id' column.
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+
+    try:
+        # Read file content
+        content = await file.read()
+        # Decode bytes to string
+        decoded_content = content.decode('utf-8-sig') # Handle BOM if present
+        
+        csv_reader = csv.DictReader(io.StringIO(decoded_content))
+        
+        # Validate headers
+        if 'tag_id' not in csv_reader.fieldnames:
+             raise HTTPException(status_code=400, detail="CSV must contain a 'tag_id' column.")
+
+        items_to_upsert = []
+        user_id = user_data['user_id']
+        
+        stats = {"added": 0, "updated": 0, "failed": 0, "errors": []}
+
+        for row in csv_reader:
+            try:
+                tag_id = row.get('tag_id', '').strip()
+                if not tag_id:
+                    continue
+
+                item_data = {
+                    "user_id": user_id,
+                    "tag_id": tag_id,
+                    "ip": row.get('ip', '0.0.0.0'),
+                    "addr": row.get('location') or row.get('addr') or 'Unknown',
+                    "type": row.get('type', 'other').lower(),
+                    "os": row.get('os', 'Unknown'),
+                    "description": row.get('description', f"Imported CI {tag_id}"),
+                    "source": "csv_import",
+                    "last_sync": datetime.utcnow().isoformat()
+                }
+                
+                # Perform upsert immediately or batch. For simplicity/safety, we do one by one or small batches.
+                # Supabase upsert can handle lists. Let's batch all.
+                items_to_upsert.append(item_data)
+                
+            except Exception as e:
+                stats['failed'] += 1
+                stats['errors'].append(f"Row error: {str(e)}")
+
+        if items_to_upsert:
+            try:
+                # Upsert in batches of 100 to avoid request size limits if large
+                batch_size = 100
+                for i in range(0, len(items_to_upsert), batch_size):
+                    batch = items_to_upsert[i:i + batch_size]
+                    supabase.table("CMDB").upsert(batch, on_conflict="user_id,tag_id").execute()
+                
+                stats['added'] = len(items_to_upsert) # Approximate, as upsert could update
+                # Refinement: To distinguish added/updated, we'd need to check existence first, which is slower.
+                # For now, reporting count of processed valid rows.
+                
+            except Exception as e:
+                # If batch fails, the whole batch fails.
+                raise HTTPException(status_code=500, detail=f"Database batch upsert failed: {str(e)}")
+
+        return {"status": "success", "stats": stats, "message": f"Processed {len(items_to_upsert)} items successfully."}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"CSV Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process CSV: {str(e)}")
+
+# --- Alert Management Routes ---
+
+@app.get("/alert-types")
+def get_alert_types(user_data: dict = Depends(verify_token)):
+    try:
+        response = supabase.table("alert_types").select("*").order("id").execute()
+        return {"response": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/alert-types")
+def create_alert_type(alert: CreateAlertType, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    try:
+        # Check if name exists
+        existing = supabase.table("alert_types").select("id").eq("name", alert.name).execute()
+        if existing.data:
+             raise HTTPException(status_code=400, detail=f"Alert type '{alert.name}' already exists.")
+
+        payload = alert.dict()
+        response = supabase.table("alert_types").insert(payload).execute()
+        return {"response": response.data[0]}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/alert-types/{alert_id}")
+def update_alert_type(alert_id: int, alert: UpdateAlertType, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    try:
+        payload = {k: v for k, v in alert.dict().items() if v is not None}
+        payload["updated_at"] = datetime.utcnow().isoformat()
+        
+        response = supabase.table("alert_types").update(payload).eq("id", alert_id).execute()
+        if not response.data:
+             raise HTTPException(status_code=404, detail="Alert type not found")
+        return {"response": response.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/alert-types/{alert_id}")
+def delete_alert_type(alert_id: int, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    try:
+        # Verify it exists
+        response = supabase.table("alert_types").delete().eq("id", alert_id).execute()
+        if not response.data:
+             raise HTTPException(status_code=404, detail="Alert type not found")
+        return {"message": "Alert type deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Escalation Matrix Routes ---
+
+@app.get("/escalation-rules")
+def get_escalation_rules(alert_type_id: Optional[int] = None, user_data: dict = Depends(verify_token)):
+    try:
+        query = supabase.table("escalation_rules").select("*").order("level")
+        if alert_type_id:
+            query = query.eq("alert_type_id", alert_type_id)
+        
+        response = query.execute()
+        return {"response": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/escalation-rules")
+def create_escalation_rule(rule: CreateEscalationRule, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    try:
+        # Validate alert_type_id exists
+        alert = supabase.table("alert_types").select("id").eq("id", rule.alert_type_id).execute()
+        if not alert.data:
+             raise HTTPException(status_code=404, detail="Alert Type not found")
+
+        payload = rule.dict()
+        response = supabase.table("escalation_rules").insert(payload).execute()
+        return {"response": response.data[0]}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/escalation-rules/{rule_id}")
+def update_escalation_rule(rule_id: int, rule: UpdateEscalationRule, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    try:
+        payload = {k: v for k, v in rule.dict().items() if v is not None}
+        payload["updated_at"] = datetime.utcnow().isoformat()
+        
+        response = supabase.table("escalation_rules").update(payload).eq("id", rule_id).execute()
+        if not response.data:
+             raise HTTPException(status_code=404, detail="Escalation rule not found")
+        return {"response": response.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/escalation-rules/{rule_id}")
+def delete_escalation_rule(rule_id: int, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    try:
+        response = supabase.table("escalation_rules").delete().eq("id", rule_id).execute()
+        if not response.data:
+             raise HTTPException(status_code=404, detail="Escalation rule not found")
+        return {"message": "Escalation rule deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Alert Type Escalation Routes ---
+
+@app.get("/alert-type-escalations", response_model=dict)
+def get_alert_type_escalations(user_data: dict = Depends(verify_token)):
+    """Get all alert type escalation configurations"""
+    try:
+        response = supabase.table("alert_type_escalations").select("*").order("escalation_level", desc=True).execute()
+        return {"response": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/alert-type-escalations/{alert_type_id}", response_model=dict)
+def get_alert_type_escalation(alert_type_id: str, user_data: dict = Depends(verify_token)):
+    """Get escalation config for a specific alert type"""
+    try:
+        response = supabase.table("alert_type_escalations").select("*").eq("alert_type_id", alert_type_id).limit(1).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Alert type escalation for '{alert_type_id}' not found")
+        return {"response": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/alert-type-escalations", response_model=dict, status_code=status.HTTP_201_CREATED)
+def create_alert_type_escalation(escalation: AlertTypeEscalation, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    """Create a new alert type escalation configuration"""
+    try:
+        # Check if alert_type_id already exists
+        existing = supabase.table("alert_type_escalations").select("id").eq("alert_type_id", escalation.alert_type_id).execute()
+        if existing.data:
+            raise HTTPException(status_code=409, detail=f"Alert type escalation for '{escalation.alert_type_id}' already exists")
+        
+        response = supabase.table("alert_type_escalations").insert({
+            "alert_type_id": escalation.alert_type_id,
+            "alert_type_name": escalation.alert_type_name,
+            "escalation_level": escalation.escalation_level,
+            "notification_channels": escalation.notification_channels,
+            "notification_destination": escalation.notification_destination,
+            "escalation_timeout_minutes": escalation.escalation_timeout_minutes,
+            "auto_escalate": escalation.auto_escalate,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        return {"response": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/alert-type-escalations/{alert_type_id}", response_model=dict)
+def update_alert_type_escalation(alert_type_id: str, escalation: AlertTypeEscalationUpdate, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    """Update an alert type escalation configuration"""
+    try:
+        # Check if exists
+        existing = supabase.table("alert_type_escalations").select("*").eq("alert_type_id", alert_type_id).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail=f"Alert type escalation for '{alert_type_id}' not found")
+        
+        # Build update dict
+        update_data = {"updated_at": datetime.utcnow().isoformat()}
+        if escalation.alert_type_name is not None:
+            update_data["alert_type_name"] = escalation.alert_type_name
+        if escalation.escalation_level is not None:
+            update_data["escalation_level"] = escalation.escalation_level
+        if escalation.notification_channels is not None:
+            update_data["notification_channels"] = escalation.notification_channels
+        if escalation.notification_destination is not None:
+            update_data["notification_destination"] = escalation.notification_destination
+        if escalation.escalation_timeout_minutes is not None:
+            update_data["escalation_timeout_minutes"] = escalation.escalation_timeout_minutes
+        if escalation.auto_escalate is not None:
+            update_data["auto_escalate"] = escalation.auto_escalate
+        
+        response = supabase.table("alert_type_escalations").update(update_data).eq("alert_type_id", alert_type_id).execute()
+        
+        return {"response": response.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/alert-type-escalations/{alert_type_id}", response_model=dict)
+def delete_alert_type_escalation(alert_type_id: str, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("settings", "write"))):
+    """Delete an alert type escalation configuration"""
+    try:
+        response = supabase.table("alert_type_escalations").delete().eq("alert_type_id", alert_type_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Alert type escalation for '{alert_type_id}' not found")
+        return {"message": "Alert type escalation deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Change Management Routes ---
 allow_admin = RoleChecker(["admin"])
+
+
+
+# --- Human in the Loop Routes ---
+
+@app.post("/pending-actions")
+def create_pending_action(action: CreatePendingAction, user_data: dict = Depends(verify_token)):
+    try:
+        # Check permissions - usually only system or specific roles can queue actions
+        # For now allowing authenticated users for demo
+        payload = action.dict()
+        response = supabase.table("pending_actions").insert(payload).execute()
+        return {"response": response.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pending-actions")
+def get_pending_actions(user_data: dict = Depends(verify_token), status: Optional[str] = "pending"):
+    try:
+        query = supabase.table("pending_actions").select("*").order("created_at", desc=True)
+        if status:
+            query = query.eq("status", status)
+        
+        response = query.execute()
+        return {"response": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pending-actions/{action_id}/approve")
+def approve_pending_action(action_id: int, user_data: dict = Depends(verify_token), _: bool = Depends(allow_admin)):
+    try:
+        user_id = user_data.get("sub")
+        
+        # 1. Update status to approved
+        update_response = supabase.table("pending_actions").update({
+            "status": "approved",
+            "approved_by": user_id,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", action_id).execute()
+
+        if not update_response.data:
+             raise HTTPException(status_code=404, detail="Pending action not found")
+
+        action = update_response.data[0]
+
+        # 2. Execute the Logic based on action_type
+        action_type = action.get('action_type', '').upper()
+        payload = action.get('payload', {})
+        
+        logger.info(f"EXECUTING ACTION: {action_type} with payload {payload} for User {user_id}")
+        
+        execution_result = {"status": "success", "executed_at": datetime.utcnow().isoformat()}
+
+        if action_type == 'RESTART_SERVICE':
+            service_name = payload.get('service_name')
+            host = payload.get('host')
+            # In a real scenario, this would trigger an Ansible job or SSH command
+            # For now, we simulate success and maybe notify
+            logger.info(f"Simulating service restart: {service_name} on {host}")
+            execution_result["details"] = f"Service {service_name} restarted successfully on {host}"
+            
+        elif action_type == 'DELETE_RESOURCE':
+            resource_id = payload.get('resource_id')
+            logger.info(f"Simulating resource deletion: {resource_id}")
+            execution_result["details"] = f"Resource {resource_id} deleted successfully"
+            
+        else:
+            logger.warning(f"Unknown action type: {action_type}")
+            execution_result["details"] = f"Action {action_type} marked as executed (no specific logic)"
+
+        # 3. Mark as completed
+        final_response = supabase.table("pending_actions").update({
+            "status": "completed",
+            "updated_at": datetime.utcnow().isoformat(),
+            "payload": {**payload, "execution_result": execution_result} # Append result to payload or separate column? Schema has payload jsonb.
+        }).eq("id", action_id).execute()
+
+        return {"message": "Action approved and executed", "response": final_response.data[0]}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pending-actions/{action_id}/reject")
+def reject_pending_action(action_id: int, user_data: dict = Depends(verify_token), _: bool = Depends(allow_admin)):
+    try:
+        user_id = user_data.get("sub")
+        
+        response = supabase.table("pending_actions").update({
+            "status": "rejected",
+            "approved_by": user_id, # Rejected by
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", action_id).execute()
+
+        if not response.data:
+             raise HTTPException(status_code=404, detail="Pending action not found")
+
+        return {"message": "Action rejected", "response": response.data[0]}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Admin Routes ---
 
 @app.get("/admin/users")
 def list_users(

@@ -5,7 +5,7 @@ requests
 beautifulsoup4
 pypdf
 pinecone
-pinecone-plugins-assistant
+
 boto3
 langchain
 langchain-core
@@ -21,3 +21,4 @@ langchain-google-vertexai
 openai
 tavily-python
 sse-starlette
+slack-sdk

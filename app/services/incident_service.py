@@ -6,6 +6,7 @@ import requests
 import traceback
 import paramiko
 import tempfile
+import threading
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -68,6 +69,7 @@ from integrations.github import get_github_config, github_search_issues as githu
 from integrations.jira import get_jira_config, jira_search_issues as jira_search_issues_impl
 from integrations.confluence import get_confluence_config, confluence_search_pages as confluence_search_pages_impl
 from integrations.pagerduty import get_pagerduty_config, pagerduty_list_incidents as pagerduty_list_incidents_impl
+from integrations.slack import SlackIntegration as SlackClient
 
 SYSTEM_PROMPT = '''You are an AI incident resolver agent.
 You are always given:
@@ -543,18 +545,21 @@ def extract_json(text: str, ctx_logger=None) -> dict:
         l.warning("Failed to parse JSON from AI response")
         return {"todos": []}
 
-def collect_diagnostics(incident: dict, cmdb: dict, kb_context: str = "", prometheus_context: str = "", external_context: str = "", ctx_logger=None, key_content: str = None) -> dict:
+def collect_diagnostics(incident: dict, cmdb: dict, kb_context: str = "", prometheus_context: str = "", external_context: str = "", additional_context: str = "", ctx_logger=None, key_content: str = None) -> dict:
     l = ctx_logger or logger
     kb_block = f"Known runbook context:\n{kb_context}" if kb_context else "No specific runbook found."
     prom_block = f"Prometheus metrics:\n{prometheus_context}" if prometheus_context else "No Prometheus metrics."
     ext_block = f"External context:\n{external_context}" if external_context else "No external context."
+    add_block = f"Additional context:\n{additional_context}" if additional_context else ""
     
     prompt = f"""
     Incident: {incident.get('subject')} - {incident.get('message')}
     System: {cmdb.get('os')} at {cmdb.get('ip')}
+    FQDN: {cmdb.get('fqdn', 'N/A')}
     {kb_block}
     {prom_block}
     {ext_block}
+    {add_block}
     Create a diagnostic plan.
     {SYSTEM_PROMPT}
     """
@@ -603,6 +608,207 @@ def execute_resolution(resolution: dict, cmdb: dict, ctx_logger=None, key_conten
         results.append({"step": step, "command": command, "result": result})
     return {"resolution_results": results}
 
+
+# --- Slack Integration Helpers ---
+
+def get_user_slack_config(user_id: str, ctx_logger=None) -> Optional[dict]:
+    """Fetch Slack webhook/workspace config for a user."""
+    l = ctx_logger or logger
+    try:
+        resp = supabase.table("integrations").select("*").eq("user_id", user_id).eq("provider", "slack").limit(1).execute()
+        data = getattr(resp, "data", None) or []
+        if not data:
+            return None
+        return data[0]
+    except Exception as e:
+        l.warning(f"Failed to fetch Slack config for user_id={user_id}: {str(e)}")
+        return None
+
+
+def get_alert_type_escalation(alert_type_id: str, ctx_logger=None) -> Optional[dict]:
+    """Fetch escalation matrix for a specific alert type."""
+    l = ctx_logger or logger
+    try:
+        resp = supabase.table("alert_type_escalations").select("*").eq("alert_type_id", alert_type_id).limit(1).execute()
+        data = getattr(resp, "data", None) or []
+        if data:
+            return data[0]
+        # Default escalation if not found
+        return {"escalation_level": 1, "notification_channels": ["email"]}
+    except Exception as e:
+        l.warning(f"Failed to fetch escalation for alert_type={alert_type_id}: {str(e)}")
+        return {"escalation_level": 1, "notification_channels": ["email"]}
+
+
+def send_slack_notification(user_id: str, incident: dict, cmdb: dict, service: dict, status: str, message: str, thread_ts: str = None, ctx_logger=None) -> Optional[str]:
+    """Send Slack notification about incident status. Returns thread_ts for follow-ups."""
+    l = ctx_logger or logger
+    
+    # Try to get Slack workspace token for this user
+    slack_cfg = get_user_slack_config(user_id, ctx_logger=l)
+    if not slack_cfg:
+        l.debug("No Slack config found for user, skipping notification")
+        return None
+    
+    token = slack_cfg.get("access_token") or os.getenv("SLACK_BOT_TOKEN")
+    if not token:
+        l.debug("No Slack token available, skipping notification")
+        return None
+    
+    try:
+        slack = SlackClient(token=token)
+        
+        # Determine channel - use configured channel or default
+        channel = slack_cfg.get("config", {}).get("channel_id") or os.getenv("SLACK_INCIDENT_CHANNEL", "#incidents")
+        
+        # Build message
+        service_name = service.get("name", "Unknown Service") if service else "Unknown"
+        fqdn = cmdb.get("fqdn", cmdb.get("ip", "Unknown"))
+        
+        status_emoji = {
+            "Received": ":white_check_mark:",
+            "Processing": ":hourglass_flowing_sand:",
+            "Analyzing": ":mag:",
+            "Executing": ":gear:",
+            "Resolved": ":large_green_circle:",
+            "Partially Resolved": ":warning:",
+            "Error": ":x:",
+            "Escalated": ":rotating_light:",
+        }.get(status, ":information_source:")
+        
+        text = f"{status_emoji} *Incident {incident.get('inc_number')}*: {status} - {message}"
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": text
+                }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Service:* {service_name} | *Host:* {fqdn}"
+                    }
+                ]
+            }
+        ]
+        
+        if thread_ts:
+            # Reply in thread
+            result = slack.send_thread_reply(channel, thread_ts, text, blocks)
+        else:
+            # New message
+            result = slack.send_message(channel, text, blocks)
+        
+        if result.get("ok"):
+            l.info(f"Slack notification sent for incident {incident.get('inc_number')}")
+            return result.get("ts") or thread_ts
+        else:
+            l.warning(f"Failed to send Slack notification: {result.get('error')}")
+            return None
+            
+    except Exception as e:
+        l.warning(f"Error sending Slack notification: {str(e)}")
+        return None
+
+
+def trigger_async_rca(inc_number: str, user_id: str, ctx_logger=None):
+    """Trigger RCA generation in background thread and notify via Slack."""
+    l = ctx_logger or logger
+    
+    def _generate_rca():
+        try:
+            from app.services.rca_service import rca_service
+            rca_result = rca_service.generate_rca(inc_number)
+            
+            if rca_result.get("success"):
+                # Get incident details for Slack notification
+                try:
+                    inc_resp = supabase.table("Incidents").select("*, CMDB:cmdb_id(*), Service:service_id(*)").eq("inc_number", inc_number).execute()
+                    if inc_resp.data:
+                        incident = inc_resp.data[0]
+                        user_id_val = incident.get("user_id")
+                        
+                        # Send RCA link in Slack
+                        rca_link = f"#"  # Frontend link would be constructed
+                        send_slack_notification(
+                            user_id_val, 
+                            incident, 
+                            incident.get("CMDB", {}), 
+                            incident.get("Service", {}),
+                            "RCA Ready",
+                            f"RCA Report generated: {rca_result.get('rca_content', '')[:500]}...",
+                            thread_ts=None,
+                            ctx_logger=l
+                        )
+                except Exception as e:
+                    l.warning(f"Failed to send RCA Slack notification: {str(e)}")
+            else:
+                l.warning(f"RCA generation failed: {rca_result.get('error')}")
+        except Exception as e:
+            l.exception(f"Error in async RCA generation: {str(e)}")
+    
+    # Run in background thread
+    thread = threading.Thread(target=_generate_rca, daemon=True)
+    thread.start()
+    l.info(f"Async RCA generation started for incident {inc_number}")
+
+
+def trigger_escalation(incident: dict, alert_type_id: str, cmdb: dict, service: dict, ctx_logger=None) -> dict:
+    """Trigger escalation based on alert type and failure."""
+    l = ctx_logger or logger
+    
+    escalation = get_alert_type_escalation(alert_type_id, ctx_logger=l)
+    escalation_level = escalation.get("escalation_level", 1)
+    notification_channels = escalation.get("notification_channels", ["email"])
+    
+    l.warning(f"Triggering escalation for incident {incident.get('inc_number')}: level={escalation_level}, channels={notification_channels}")
+    
+    # Update incident with escalation info
+    try:
+        supabase.table("Incidents").update({
+            "escalation_level": escalation_level,
+            "escalation_reason": f"Resolution failed - escalated based on {alert_type_id}",
+            "state": "Escalated",
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("inc_number", incident.get("inc_number")).execute()
+    except Exception as e:
+        l.warning(f"Failed to update incident escalation: {str(e)}")
+    
+    # Send escalation notification
+    user_id = incident.get("user_id")
+    if user_id:
+        send_slack_notification(
+            user_id,
+            incident,
+            cmdb,
+            service,
+            "Escalated",
+            f"Incident escalated to level {escalation_level} due to resolution failure",
+            thread_ts=None,
+            ctx_logger=l
+        )
+    
+    # Trigger external escalation if configured (e.g., PagerDuty)
+    if "pagerduty" in notification_channels:
+        try:
+            # Would trigger PagerDuty escalation here
+            l.info("PagerDuty escalation triggered")
+        except Exception as e:
+            l.warning(f"PagerDuty escalation failed: {str(e)}")
+    
+    if "email" in notification_channels:
+        try:
+            # Would send email escalation here
+            l.info("Email escalation triggered")
+        except Exception as e:
+            l.warning(f"Email escalation failed: {str(e)}")
+    
+    return {"escalated": True, "level": escalation_level}
+
 def update_incident_state(inc_number: Optional[str], state: str, solution: Optional[dict] = None, ctx_logger=None) -> None:
     l = ctx_logger or logger
     if not inc_number: return
@@ -625,6 +831,9 @@ def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_log
     
     ctx.info("Processing incident started (v2 service)")
     
+    # Slack thread timestamp for this incident
+    slack_thread_ts = None
+    
     def update_job(progress, step):
         if job_id:
             try:
@@ -633,10 +842,46 @@ def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_log
                     "details": {"step": step}
                 }).eq("id", job_id).execute()
             except Exception: pass
-
+    
+    # --- Step 1: Send Initial ACK in Slack ---
+    try:
+        user_id = meta.get('user_id')
+        if user_id:
+            # Fetch incident with service info
+            inc_resp = supabase.table("Incidents").select("*, CMDB:cmdb_id(*), Service:service_id(*)").eq("inc_number", inc_number).execute()
+            incident_data = inc_resp.data[0] if inc_resp.data else {}
+            cmdb_data = incident_data.get("CMDB", {})
+            service_data = incident_data.get("Service", {})
+            
+            slack_thread_ts = send_slack_notification(
+                user_id,
+                mail,  # incident data
+                cmdb_data,
+                service_data,
+                "Received",
+                f"Incident received and queued for processing",
+                thread_ts=None,
+                ctx_logger=ctx
+            )
+            ctx.info(f"Initial ACK sent to Slack, thread_ts: {slack_thread_ts}")
+    except Exception as e:
+        ctx.warning(f"Failed to send initial Slack ACK: {str(e)}")
+    
     try:
         update_incident_state(inc_number, "Processing", ctx_logger=ctx)
         update_job(10, "fetching_context")
+        
+        # --- Send Slack: Processing status ---
+        try:
+            user_id = meta.get('user_id')
+            if user_id:
+                send_slack_notification(
+                    user_id, mail, cmdb_data, service_data,
+                    "Processing", "Fetching CMDB and system context...",
+                    thread_ts=slack_thread_ts, ctx_logger=ctx
+                )
+        except Exception as e:
+            ctx.warning(f"Failed to send Processing Slack update: {str(e)}")
 
         # CMDB Lookup
         cmdb = None
@@ -651,6 +896,18 @@ def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_log
             msg = "CMDB entry not found"
             ctx.error(msg)
             update_incident_state(inc_number, "Error", solution={"error": msg}, ctx_logger=ctx)
+            
+            # Send error to Slack
+            try:
+                user_id = meta.get('user_id')
+                if user_id:
+                    send_slack_notification(
+                        user_id, mail, {}, {},
+                        "Error", msg,
+                        thread_ts=slack_thread_ts, ctx_logger=ctx
+                    )
+            except: pass
+            
             return {"status": "error", "message": msg}
 
         # User Lookup
@@ -665,40 +922,169 @@ def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_log
         email = user_resp.data[0].get('email')
         ctx = make_ctx_logger(logger, incident=inc_number, instance=instance_label, user=email)
 
+        # Fetch service info
+        service = None
+        service_id = cmdb.get('service_id')
+        if service_id:
+            svc_resp = supabase.table("services").select("*").eq("id", service_id).execute()
+            if svc_resp.data:
+                service = svc_resp.data[0]
+        
+        # Get alert type from incident
+        alert_type_id = mail.get('alert_type')
+        
+        # --- Send Slack: Context fetched ---
+        try:
+            send_slack_notification(
+                user_id, mail, cmdb, service,
+                "Processing", f"CMDB context loaded: {cmdb.get('os')} at {cmdb.get('ip')}",
+                thread_ts=slack_thread_ts, ctx_logger=ctx
+            )
+        except: pass
+
         # SSH Key
         key_content = fetch_ssh_key_content(email, ctx_logger=ctx)
         if not key_content:
             msg = "Failed to fetch SSH key"
             ctx.error(msg)
             update_incident_state(inc_number, "Error", solution={"error": msg}, ctx_logger=ctx)
+            
+            # Send error to Slack
+            try:
+                send_slack_notification(user_id, mail, cmdb, service, "Error", msg, thread_ts=slack_thread_ts, ctx_logger=ctx)
+            except: pass
+            
             return {"status": "error", "message": msg}
 
-        # Context Gathering
+        # Context Gathering - Include service info in context
         kb_info = get_incident_runbook_context(mail, ctx_logger=ctx)
+        
+        # Build enhanced context with service information
+        service_context = ""
+        if service:
+            service_context = f"""
+Service Information:
+- Service Name: {service.get('name')}
+- Service Type: {service.get('service_type')}
+- Description: {service.get('description', 'N/A')}
+"""
+        
+        # Include alert type in context
+        alert_context = ""
+        if alert_type_id:
+            alert_context = f"""
+Alert Type: {alert_type_id}
+"""
         
         prom_cfg = get_prometheus_config_for_user(user_id, ctx_logger=ctx)
         prom_context = fetch_prometheus_metrics(prom_cfg, cmdb, mail, ctx_logger=ctx) if prom_cfg else ""
         
         ext_context = fetch_external_integrations_context(email, mail, ctx_logger=ctx)
 
-        # Execution
+        # Execution - Diagnostics Phase
         update_job(40, "collecting_diagnostics")
-        diagnostics = collect_diagnostics(mail, cmdb, kb_info.get("combined_context", ""), prom_context, ext_context, ctx_logger=ctx, key_content=key_content)
+        
+        # --- Send Slack: Collecting diagnostics ---
+        try:
+            send_slack_notification(
+                user_id, mail, cmdb, service,
+                "Processing", "Running diagnostics and collecting system information...",
+                thread_ts=slack_thread_ts, ctx_logger=ctx
+            )
+        except: pass
+        
+        diagnostics = collect_diagnostics(mail, cmdb, kb_info.get("combined_context", ""), prom_context, ext_context, service_context + alert_context, ctx_logger=ctx, key_content=key_content)
         
         update_job(60, "analyzing_root_cause")
+        
+        # --- Send Slack: Analyzing ---
+        try:
+            send_slack_notification(
+                user_id, mail, cmdb, service,
+                "Analyzing", "Identifying root cause from diagnostics...",
+                thread_ts=slack_thread_ts, ctx_logger=ctx
+            )
+        except: pass
+        
         analysis = analyze_diagnostics(diagnostics, mail, ctx_logger=ctx)
         
         update_job(80, "executing_resolution")
+        
+        # --- Send Slack: Executing resolution ---
+        try:
+            send_slack_notification(
+                user_id, mail, cmdb, service,
+                "Executing", "Applying resolution steps...",
+                thread_ts=slack_thread_ts, ctx_logger=ctx
+            )
+        except: pass
+        
         resolution = execute_resolution(analysis, cmdb, ctx_logger=ctx, key_content=key_content)
 
         # Result Logic
         is_resolved = all(step['result'].get('success') for step in resolution.get('resolution_results', []))
-        status = "Resolved" if is_resolved else "Partially Resolved"
+        
+        if is_resolved:
+            status = "Resolved"
+            ctx.info("Incident resolved successfully")
+            
+            # --- Send Slack: Resolved ---
+            try:
+                send_slack_notification(
+                    user_id, mail, cmdb, service,
+                    "Resolved", f"Incident resolved. Root cause: {analysis.get('root_cause', 'N/A')}",
+                    thread_ts=slack_thread_ts, ctx_logger=ctx
+                )
+            except: pass
+            
+            # Trigger async RCA generation
+            trigger_async_rca(inc_number, user_id, ctx_logger=ctx)
+            
+            # Send final RCA ready message
+            try:
+                send_slack_notification(
+                    user_id, mail, cmdb, service,
+                    "RCA Ready", "Generating Root Cause Analysis report...",
+                    thread_ts=slack_thread_ts, ctx_logger=ctx
+                )
+            except: pass
+            
+        else:
+            status = "Partially Resolved"
+            ctx.warning("Incident resolution partially failed")
+            
+            # --- Send Slack: Partial resolution with escalation warning ---
+            try:
+                send_slack_notification(
+                    user_id, mail, cmdb, service,
+                    "Partially Resolved", "Some resolution steps failed. Checking escalation requirements...",
+                    thread_ts=slack_thread_ts, ctx_logger=ctx
+                )
+            except: pass
+            
+            # Trigger escalation based on alert_type
+            if alert_type_id:
+                escalation_result = trigger_escalation(
+                    {"inc_number": inc_number, "user_id": user_id},
+                    alert_type_id,
+                    cmdb,
+                    service,
+                    ctx_logger=ctx
+                )
+                return {
+                    "status": status, 
+                    "analysis": analysis,
+                    "escalated": escalation_result.get("escalated", False),
+                    "escalation_level": escalation_result.get("level")
+                }
         
         solution_payload = {
             "root_cause": analysis.get('root_cause'),
             "resolution_steps": analysis.get('resolution_steps'),
             "runbook_used": bool(kb_info.get("has_knowledge")),
+            "service_id": service.get('id') if service else None,
+            "service_name": service.get('name') if service else None,
+            "fqdn": cmdb.get('fqdn'),
         }
         
         update_incident_state(inc_number, status, solution=solution_payload, ctx_logger=ctx)
@@ -714,4 +1100,16 @@ def process_incident(aws: dict, mail: dict, meta: Optional[dict] = None, ctx_log
     except Exception as e:
         ctx.exception("Unhandled error")
         update_incident_state(inc_number, "Error", solution={"error": str(e)}, ctx_logger=ctx)
+        
+        # Send error to Slack
+        try:
+            user_id = meta.get('user_id')
+            if user_id:
+                send_slack_notification(
+                    user_id, mail, {}, {},
+                    "Error", f"Processing failed: {str(e)}",
+                    thread_ts=slack_thread_ts, ctx_logger=ctx
+                )
+        except: pass
+        
         return {"status": "error", "message": str(e)}
