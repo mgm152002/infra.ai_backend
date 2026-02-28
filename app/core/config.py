@@ -8,6 +8,9 @@ class Settings(BaseModel):
     # Supabase
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+    SUPABASE_POSTGREST_TIMEOUT_S: float = float(os.getenv("SUPABASE_POSTGREST_TIMEOUT_S", "120"))
+    SUPABASE_STORAGE_TIMEOUT_S: int = int(os.getenv("SUPABASE_STORAGE_TIMEOUT_S", "60"))
+    SUPABASE_FUNCTION_TIMEOUT_S: int = int(os.getenv("SUPABASE_FUNCTION_TIMEOUT_S", "30"))
 
     # AI / LLM
     PINECONE_API_KEY: str = os.getenv("Pinecone_Api_Key", "")
@@ -24,7 +27,7 @@ class Settings(BaseModel):
     # Worker Settings
     WORKER_COUNT: int = int(os.getenv("WORKER_COUNT", "1"))
     CHAT_WORKER_COUNT: int = int(os.getenv("CHAT_WORKER_COUNT", "1"))
-    SQS_QUEUE_NAME: str = os.getenv("SQS_QUEUE_NAME", "infraaiqueue.fifo")
+    SQS_QUEUE_NAME: str = os.getenv("SQS_QUEUE_NAME", "Chatqueue")
     SQS_VISIBILITY_TIMEOUT: int = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "900"))
 
     # Integrations

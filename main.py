@@ -2,6 +2,8 @@ from typing import Union, Optional, List, Dict, Any
 import csv
 import io
 import codecs
+import queue
+import threading
 from datetime import datetime
 from fastapi import FastAPI, security, Depends, BackgroundTasks, HTTPException, UploadFile, File, Response
 from fastapi import status
@@ -64,6 +66,8 @@ from worker import worker_loop
 from app.core.middleware import RequestLoggingMiddleware
 from app.core.security import verify_token, has_permission, RoleChecker, get_current_user
 from app.core.logger import logger
+from app.core.config import settings
+from app.core.supabase_timeout import run_supabase_with_timeout, SupabaseTimeoutError
 from app.schemas.credentials import SlackConfig, EmailConfig
 from app.schemas.models import AlertTypeEscalation, AlertTypeEscalationUpdate
 from app.services.notification_service import NotificationService
@@ -78,6 +82,25 @@ from integrations.github import (
     github_search_commits as github_search_commits_impl,
     github_get_issue as github_get_issue_impl,
     github_get_commit as github_get_commit_impl,
+)
+from integrations.github_mcp import (
+    github_mcp_server,
+    mcp_list_repositories,
+    mcp_search_repositories,
+    mcp_list_issues,
+    mcp_get_issue,
+    mcp_create_issue,
+    mcp_update_issue,
+    mcp_list_pull_requests,
+    mcp_get_pull_request,
+    mcp_list_commits,
+    mcp_get_commit,
+    mcp_list_branches,
+    mcp_get_branch,
+    mcp_list_workflows,
+    mcp_list_workflow_runs,
+    mcp_get_workflow_run,
+    mcp_list_actions_artifacts,
 )
 from integrations.jira import (
     get_jira_config,
@@ -113,7 +136,18 @@ class EscalationService:
             try:
                 # 1. Fetch open incidents
                 # We fetch incidents that are NOT Resolved or Closed
-                response = supabase.table("Incidents").select("*").not_.in_("state", ["Resolved", "Closed"]).execute()
+                # Use a more efficient approach: query for known open states instead of excluding
+                # This is faster because it uses IN which is more efficient than NOT IN
+                response = run_supabase_with_timeout(
+                    lambda: supabase.table("Incidents")
+                    .select("id,inc_number,external_urgency,alert_type_id,external_payload,updated_at,created_at,user_id")
+                    .in_("state", ["New", "Queued", "InProgress", "Assigned", "Open", "On Hold"])
+                    .order("updated_at", desc=True)
+                    .limit(100)  # Reduced from 300 to 100 for faster processing
+                    .execute(),
+                    timeout_s=120,  # Increased timeout for this query
+                    operation_name="escalation_open_incidents_query",
+                )
                 incidents = response.data or []
 
                 for inc in incidents:
@@ -128,10 +162,18 @@ class EscalationService:
                         
                         if alert_type_id:
                             # Fetch directly using ID
-                            at_resp = supabase.table("alert_types").select("*").eq("id", alert_type_id).limit(1).execute()
+                            at_resp = run_supabase_with_timeout(
+                                lambda: supabase.table("alert_types").select("*").eq("id", alert_type_id).limit(1).execute(),
+                                timeout_s=30,
+                                operation_name="escalation_alert_type_by_id",
+                            )
                         else:
                             # Fallback: Find matching Alert Type for this urgency
-                            at_resp = supabase.table("alert_types").select("*").eq("priority", urgency).limit(1).execute()
+                            at_resp = run_supabase_with_timeout(
+                                lambda: supabase.table("alert_types").select("*").eq("priority", urgency).limit(1).execute(),
+                                timeout_s=30,
+                                operation_name="escalation_alert_type_by_priority",
+                            )
                             
                         if not at_resp.data:
                             continue
@@ -139,7 +181,11 @@ class EscalationService:
                         alert_type = at_resp.data[0]
                         
                         # Fetch Rules based on Alert Type ID
-                        rules_resp = supabase.table("escalation_rules").select("*").eq("alert_type_id", alert_type['id']).order("level").execute()
+                        rules_resp = run_supabase_with_timeout(
+                            lambda: supabase.table("escalation_rules").select("*").eq("alert_type_id", alert_type['id']).order("level").execute(),
+                            timeout_s=30,
+                            operation_name="escalation_rules_query",
+                        )
                         rules = rules_resp.data or []
                         
                         if not rules:
@@ -161,10 +207,13 @@ class EscalationService:
                         # Handle Postgres timestamp format (may or may not have Z or timezone)
                         try:
                             last_activity = datetime.fromisoformat(last_activity_str.replace('Z', '+00:00'))
+                            # Ensure last_activity is timezone-aware (make it UTC if naive)
+                            if last_activity.tzinfo is None:
+                                last_activity = last_activity.replace(tzinfo=timezone.utc)
                         except ValueError:
                             # Fallback if format is different
                             continue
-                            
+                        
                         now = datetime.now(timezone.utc)
                         diff_minutes = (now - last_activity).total_seconds() / 60
                         
@@ -199,10 +248,14 @@ class EscalationService:
                                 
                                 # 2. Update Incident
                                 ext_payload['escalation_level'] = rule_level
-                                supabase.table("Incidents").update({
-                                    "external_payload": ext_payload,
-                                    "updated_at": datetime.utcnow().isoformat()
-                                }).eq("id", inc_id).execute()
+                                run_supabase_with_timeout(
+                                    lambda: supabase.table("Incidents").update({
+                                        "external_payload": ext_payload,
+                                        "updated_at": datetime.utcnow().isoformat()
+                                    }).eq("id", inc_id).execute(),
+                                    timeout_s=30,
+                                    operation_name="escalation_incident_update",
+                                )
                                 
                                 # Break after triggering one level (step-by-step escalation)
                                 break
@@ -258,6 +311,14 @@ async def worker_lifespan(app: FastAPI):
         chat_worker_count = 1
     chat_worker_count = min(chat_worker_count, 64)
 
+    incident_queue_name = os.getenv("SQS_QUEUE_NAME", settings.SQS_QUEUE_NAME or "Chatqueue")
+    if CHAT_QUEUE_NAME == incident_queue_name:
+        logger.warning(
+            f"CHAT_QUEUE_NAME ('{CHAT_QUEUE_NAME}') matches incident SQS queue "
+            f"('{incident_queue_name}'). Disabling chat workers to avoid queue contention."
+        )
+        chat_worker_count = 0
+
     for i in range(chat_worker_count):
         thread = threading.Thread(target=chat_worker_loop, daemon=True, name=f"ChatWorker-{i+1}")
         thread.start()
@@ -278,6 +339,8 @@ from app.api.routers import workflow
 app.include_router(workflow.router, prefix="/api/v1/workflow", tags=["Workflow"])
 from app.api.routers import admin
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
+from app.api.routers import sse
+app.include_router(sse.router, prefix="/api/v1", tags=["SSE"])
 
 # Load Slack client on startup if configured
 from app.integrations.slack import slack_client
@@ -312,8 +375,9 @@ session = boto3.Session(
     region_name='ap-south-1'
 )
 
-# SQS/Redis configuration for async chat processing
-CHAT_QUEUE_NAME = "Chatqueue"
+# SQS/Redis configuration for async chat processing.
+# Keep chat queue separate from incident queue to avoid cross-consumption.
+CHAT_QUEUE_NAME = os.getenv("CHAT_QUEUE_NAME", "ChatqueueAsync")
 CHAT_JOB_TTL_SECONDS = 60 * 60  # 1 hour TTL for chat job results in Redis
 
 from app.core.llm import get_llm, call_llm
@@ -324,7 +388,7 @@ DEFAULT_MODEL_NAME = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.2")
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], # Specific origin
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -482,8 +546,12 @@ AVAILABLE TOOLS AND WHEN TO USE THEM
   - Provide updates as a dictionary (e.g., {'state': 'InProgress'}).
 
 - `infra_automation_ai(mesaage, mail)`
-  - Use whenever the request involves infrastructure changes, server actions, or SOP-style manual steps
+  - CRITICAL TOOL: Use whenever the request involves infrastructure changes, server actions, or SOP-style manual steps
     (for example: "install docker on this EC2 instance", "go to the AWS console and create a VM", "log in to the server and run these commands").
+  - This tool converts instructions into Ansible-based automation and executes them in the user's AWS environment.
+  - It retrieves AWS credentials and SSH keys from Infisical automatically.
+  - The tool generates Ansible playbooks, installs required modules via ansible-galaxy, creates inventory files, and executes the playbooks remotely.
+  - Returns playbook output (stdout) and any errors (stderr) encountered during execution.
   - Pass the full user request (and any relevant SOP text) as `mesaage`.
 
 - `create_incident(create, mail)`, `update_incident(incident_number, updates, mail)`, `get_incident_details(incident_number, mail)`
@@ -517,6 +585,9 @@ AVAILABLE TOOLS AND WHEN TO USE THEM
   - Use when the user asks about the root cause of an incident, RCA report details, or what caused a specific incident.
   - ALWAYS call this tool when investigating incident causes, during incident resolution, or when the user asks for RCA.
   - This tool should be used alongside other tools like ask_knowledge_base, get_local_incident_details, etc. when solving incidents.
+
+- GitHub MCP Tools (github_mcp_*)
+  - Use for advanced GitHub operations including repository management, issue/PR lifecycle, commit history, branch management, and GitHub Actions workflow monitoring.
 
 MANDATORY TOOL ORDERING FOR INCIDENTS
 1. When solving an incident, first call `ask_knowledge_base` with the incident details to look for relevant runbooks or SOPs.
@@ -1695,9 +1766,7 @@ def queueAdd(Req:RequestBody):
     content_hash = hashlib.sha256(message_body.encode()).hexdigest()
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
     sqsqueue.send_message(
-        MessageBody=message_body,
-        MessageGroupId=(Req.Mail.inc_number or "infraai").strip()[:128],  # per-incident with safe fallback
-        MessageDeduplicationId=unique_id
+        MessageBody=message_body
     )
 
 @app.post("/queueRemove")
@@ -1994,47 +2063,74 @@ def getAwsKeys(mail:str):
 
 
 @app.get("/getIncidentsDetails/{inc_number}")
-def getIncidentsDetails(inc_number: str):
-   response = supabase.from_("Incidents").select("short_description").eq("inc_number", inc_number).execute()
-   short_desc = response.data[0]["short_description"] if response.data else "No description provided."
+def getIncidentsDetails(inc_number: str, user_data: dict = Depends(verify_token)):
+    """
+    Return full incident details for the authenticated user.
+    Includes compatibility fields `potential_cause` and `potential_solution`
+    derived from persisted incident solution/results when available.
+    """
+    user_id = user_data.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-# 🤖 Init model via OpenRouter
-   llm = get_llm()
+    inc_resp = (
+        supabase.from_("Incidents")
+        .select("*")
+        .eq("inc_number", inc_number)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not inc_resp.data:
+        raise HTTPException(status_code=404, detail="Incident not found")
 
-# 🧠 Prompt template
-   prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are an expert incident responder."),
-    ("user", 
-    """Given the following incident short description, determine:
-1. potential_cause
-2. potential_solution
+    incident = inc_resp.data[0]
+    potential_cause = ""
+    potential_solution = ""
 
-Respond only in JSON format like this:
-{{"potential_cause": "...", "potential_solution": "..."}}
+    # Prefer structured `solution` on incident when available.
+    raw_solution = incident.get("solution")
+    if isinstance(raw_solution, str):
+        try:
+            raw_solution = json.loads(raw_solution)
+        except Exception:
+            raw_solution = {}
+    if isinstance(raw_solution, dict):
+        potential_cause = raw_solution.get("root_cause") or ""
+        steps = raw_solution.get("resolution_steps")
+        if isinstance(steps, list):
+            potential_solution = "\n".join(str(s) for s in steps[:5])
+        elif isinstance(steps, str):
+            potential_solution = steps
 
-Short description: {short_description}
-{format_instructions}
-""")
-])
+    # Fallback to latest Results record if solution is not populated yet.
+    if not potential_cause or not potential_solution:
+        res_resp = (
+            supabase.table("Results")
+            .select("description")
+            .eq("inc_number", inc_number)
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res_resp.data:
+            desc = res_resp.data[0].get("description")
+            if isinstance(desc, str):
+                try:
+                    desc = json.loads(desc)
+                except Exception:
+                    desc = {}
+            if isinstance(desc, dict):
+                analysis = desc.get("analysis", {}) if isinstance(desc.get("analysis"), dict) else {}
+                potential_cause = potential_cause or analysis.get("root_cause", "")
+                potential_solution = potential_solution or analysis.get("resolution_steps", "")
 
-# 🧾 JSON Parser
-   parser = JsonOutputParser()
+    incident["potential_cause"] = potential_cause or "No cause found."
+    incident["potential_solution"] = potential_solution or "No solution found."
+    incident["description"] = incident.get("description") or incident.get("short_description") or "No description available."
 
-# 🔗 Chain
-   chain: Runnable = prompt | llm | parser
-
-# 🚀 Execute
-   result = chain.invoke({
-    "short_description": short_desc,
-    "format_instructions": parser.get_format_instructions()
-})
-   result['description']= short_desc
-# 🖨️ Output
-   print(result)
-
-
-
-   return{"response": result}  
+    return {"response": incident}
 
 
 @app.post("/addSNOWCredentials")
@@ -2140,23 +2236,35 @@ def addAwsCredentials(Aws: Aws,credentials: Annotated[HTTPAuthorizationCredentia
     
    
         
+    # Create dictionary for AWS credentials - use full email
     awsdict={
         f"AWS_ACCESS_KEY_{mail}": Aws.access_key,
         f"AWS_SECRET_KEY_{mail}": Aws.secrete_access,
         f"AWS_REGION_{mail}": Aws.region
     }
+    
+    # Try to save credentials, if fails with 400, retry with original email
     for key, value in awsdict.items():
-            url = f"https://us.infisical.com/api/v3/secrets/raw/{key}"
-            payload = {
-    "environment": "prod",
-    "secretValue": value,
-    "workspaceId": "113f5a41-dbc3-447d-8b3a-6fe8e9e6e99c"
-    }   
-            headers = {
-    "Authorization": auth_headers['Authorization'],
-    "Content-Type": "application/json"
-}
+        url = f"https://us.infisical.com/api/v3/secrets/raw/{key}"
+        payload = {
+            "environment": "prod",
+            "secretValue": value,
+            "workspaceId": "113f5a41-dbc3-447d-8b3a-6fe8e9e6e99c"
+        }
+        headers = {
+            "Authorization": auth_headers['Authorization'],
+            "Content-Type": "application/json"
+        }
+        try:
             response = requests.request("POST", url, json=payload, headers=headers)
+            # If we get a 400 error with sanitized email, retry with original email
+            if response.status_code == 400 and '_AT_' not in key:
+                print(f"DEBUG addAwsCredentials: Got 400 error with key {key}, retrying with sanitized key...")
+                # The key is already sanitized, this shouldn't happen but just in case
+                continue
+        except Exception as e:
+            print(f"Error saving AWS credential {key}: {e}")
+            continue
 
     return {"response": "done"}
    
@@ -2170,16 +2278,32 @@ def addAwsCredentials(Aws: Aws,credentials: Annotated[HTTPAuthorizationCredentia
 @app.get("/allIncidents")
 
 def allIncidents(user_data: dict = Depends(verify_token)):
+    user_id = user_data.get("user_id")
+    mail = user_data.get("email")
+    try:
+        if user_id is None and mail:
+            user_response = run_supabase_with_timeout(
+                lambda: supabase.table("Users").select("id").eq("email", mail).limit(1).execute(),
+                timeout_s=60,
+                operation_name="allIncidents_user_lookup",
+            )
+            if not user_response.data:
+                return {"response": {"data": []}}
+            user_id = user_response.data[0]["id"]
 
-    mail = user_data['email']
+        if user_id is None:
+            return {"response": {"data": []}}
 
-    user_response = supabase.table("Users").select("id").eq("email", mail).execute()
-    
-    if user_response.data and len(user_response.data) > 0:
-        user_id = user_response.data[0]['id']
-        # Then query incidents by user_id
-        response = supabase.table("Incidents").select("*, Users(*)").eq("user_id", user_id).execute()
-    return{"response": response}
+        # Optimize query: select only needed columns and use limit
+        response = run_supabase_with_timeout(
+            lambda: supabase.table("Incidents").select("id,inc_number,short_description,state,created_at,updated_at,alert_type_id,external_urgency,external_payload").eq("user_id", user_id).order("created_at", desc=True).limit(500).execute(),
+            timeout_s=120,
+            operation_name="allIncidents_query",
+        )
+        return {"response": response}
+    except SupabaseTimeoutError:
+        # Fail fast so dashboard can recover/retry instead of hanging forever.
+        return {"response": {"data": []}, "warning": "Incidents query timed out; please retry"}
 
 @app.post("/storeJwt/{jwt}")
 
@@ -2963,6 +3087,322 @@ def github_get_commit(
     )
 
 
+# --- GitHub MCP Tools ---
+
+@tool
+def github_mcp_list_repositories(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    max_results: int = 10,
+):
+    """List GitHub repositories for the authenticated user or organization.
+    
+    Use this tool to list repositories the user has access to.
+    
+    Args:
+        owner: Organization owner (optional)
+        repo: Repository name (optional)
+        max_results: Maximum number of results (default 10)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_repositories(mail=mail, owner=owner, repo=repo, max_results=max_results)
+
+
+@tool
+def github_mcp_search_repositories(
+    mail: str = "",
+    query: str = "",
+    max_results: int = 10,
+):
+    """Search GitHub repositories by keyword.
+    
+    Use this tool to search for public and private repositories.
+    
+    Args:
+        query: Search query (e.g., 'topic:python language:javascript')
+        max_results: Maximum number of results (default 10)
+        mail: User's email (injected by backend)
+    """
+    return mcp_search_repositories(mail=mail, query=query, max_results=max_results)
+
+
+@tool
+def github_mcp_list_issues(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    state: str = "open",
+    max_results: int = 10,
+):
+    """List issues for a GitHub repository.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        state: Issue state - 'open', 'closed', or 'all' (default: open)
+        max_results: Maximum number of results (default 10)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_issues(mail=mail, owner=owner, repo=repo, state=state, max_results=max_results)
+
+
+@tool
+def github_mcp_get_issue(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    number: int = 0,
+):
+    """Get a specific GitHub issue by number.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        number: Issue number
+        mail: User's email (injected by backend)
+    """
+    return mcp_get_issue(mail=mail, owner=owner, repo=repo, number=number)
+
+
+@tool
+def github_mcp_create_issue(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    title: str = "",
+    body: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+    assignees: Optional[List[str]] = None,
+):
+    """Create a new GitHub issue.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        title: Issue title (required)
+        body: Issue description
+        labels: List of labels
+        assignees: List of assignees (usernames)
+        mail: User's email (injected by backend)
+    """
+    return mcp_create_issue(mail=mail, owner=owner, repo=repo, title=title, body=body, labels=labels, assignees=assignees)
+
+
+@tool
+def github_mcp_update_issue(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    number: int = 0,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    state: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+    assignees: Optional[List[str]] = None,
+):
+    """Update an existing GitHub issue.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        number: Issue number
+        title: New title
+        body: New body/description
+        state: New state ('open' or 'closed')
+        labels: New labels (list)
+        assignees: New assignees (list)
+        mail: User's email (injected by backend)
+    """
+    return mcp_update_issue(mail=mail, owner=owner, repo=repo, number=number, title=title, body=body, state=state, labels=labels, assignees=assignees)
+
+
+@tool
+def github_mcp_list_pull_requests(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    state: str = "open",
+    max_results: int = 10,
+):
+    """List pull requests for a GitHub repository.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        state: PR state - 'open', 'closed', or 'all' (default: open)
+        max_results: Maximum number of results (default 10)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_pull_requests(mail=mail, owner=owner, repo=repo, state=state, max_results=max_results)
+
+
+@tool
+def github_mcp_get_pull_request(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    number: int = 0,
+):
+    """Get a specific pull request.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        number: PR number
+        mail: User's email (injected by backend)
+    """
+    return mcp_get_pull_request(mail=mail, owner=owner, repo=repo, number=number)
+
+
+@tool
+def github_mcp_list_commits(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    max_results: int = 10,
+    sha: Optional[str] = None,
+    path: Optional[str] = None,
+):
+    """List commits for a GitHub repository.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        max_results: Maximum number of results (default 10)
+        sha: Branch or commit SHA to list commits from
+        path: Filter commits by file path
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_commits(mail=mail, owner=owner, repo=repo, max_results=max_results, sha=sha, path=path)
+
+
+@tool
+def github_mcp_get_commit(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    sha: str = "",
+):
+    """Get details of a specific commit.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        sha: Commit SHA
+        mail: User's email (injected by backend)
+    """
+    return mcp_get_commit(mail=mail, owner=owner, repo=repo, sha=sha)
+
+
+@tool
+def github_mcp_list_branches(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+):
+    """List branches for a GitHub repository.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_branches(mail=mail, owner=owner, repo=repo)
+
+
+@tool
+def github_mcp_get_branch(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    branch: str = "",
+):
+    """Get a specific branch.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        branch: Branch name
+        mail: User's email (injected by backend)
+    """
+    return mcp_get_branch(mail=mail, owner=owner, repo=repo, branch=branch)
+
+
+@tool
+def github_mcp_list_workflows(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+):
+    """List GitHub Actions workflows for a repository.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_workflows(mail=mail, owner=owner, repo=repo)
+
+
+@tool
+def github_mcp_list_workflow_runs(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    workflow_id: Optional[int] = None,
+    status: Optional[str] = None,
+    max_results: int = 10,
+):
+    """List GitHub Actions workflow runs.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        workflow_id: Workflow ID (optional, lists all if not provided)
+        status: Filter by status (completed, in_progress, etc.)
+        max_results: Maximum number of results (default 10)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_workflow_runs(mail=mail, owner=owner, repo=repo, workflow_id=workflow_id, status=status, max_results=max_results)
+
+
+@tool
+def github_mcp_get_workflow_run(
+    mail: str = "",
+    owner: str = "",
+    repo: str = "",
+    run_id: int = 0,
+):
+    """Get a specific GitHub Actions workflow run.
+    
+    Args:
+        owner: Repository owner
+        repo: Repository name
+        run_id: Workflow run ID
+        mail: User's email (injected by backend)
+    """
+    return mcp_get_workflow_run(mail=mail, owner=owner, repo=repo, run_id=run_id)
+
+
+@tool
+def github_mcp_list_artifacts(
+    mail: str = "",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    max_results: int = 10,
+):
+    """List artifacts for a GitHub repository.
+    
+    Args:
+        owner: Repository owner (uses default if not provided)
+        repo: Repository name (uses default if not provided)
+        max_results: Maximum number of results (default 10)
+        mail: User's email (injected by backend)
+    """
+    return mcp_list_actions_artifacts(mail=mail, owner=owner, repo=repo, max_results=max_results)
+
+
 @tool
 def jira_search_issues(jql: str, max_results: int = 10, mail: str = ""):
     """Search Jira issues using JQL (Jira Cloud REST API v3)."""
@@ -3258,10 +3698,29 @@ tools = [
     getfromcmdb,
     infra_automation_ai,
     prometheus_query,
+    # GitHub tools (legacy)
     github_search_issues,
     github_search_commits,
     github_get_issue,
     github_get_commit,
+    # GitHub MCP tools
+    github_mcp_list_repositories,
+    github_mcp_search_repositories,
+    github_mcp_list_issues,
+    github_mcp_get_issue,
+    github_mcp_create_issue,
+    github_mcp_update_issue,
+    github_mcp_list_pull_requests,
+    github_mcp_get_pull_request,
+    github_mcp_list_commits,
+    github_mcp_get_commit,
+    github_mcp_list_branches,
+    github_mcp_get_branch,
+    github_mcp_list_workflows,
+    github_mcp_list_workflow_runs,
+    github_mcp_get_workflow_run,
+    github_mcp_list_artifacts,
+    # Jira tools
     jira_search_issues,
     jira_get_issue,
     confluence_search_pages,
@@ -3306,6 +3765,23 @@ TOOLS_REQUIRING_MAIL = {
     "search_local_cmdb",
     "get_local_cmdb_item",
     "get_local_cmdb_count",
+    # GitHub MCP tools
+    "github_mcp_list_repositories",
+    "github_mcp_search_repositories",
+    "github_mcp_list_issues",
+    "github_mcp_get_issue",
+    "github_mcp_create_issue",
+    "github_mcp_update_issue",
+    "github_mcp_list_pull_requests",
+    "github_mcp_get_pull_request",
+    "github_mcp_list_commits",
+    "github_mcp_get_commit",
+    "github_mcp_list_branches",
+    "github_mcp_get_branch",
+    "github_mcp_list_workflows",
+    "github_mcp_list_workflow_runs",
+    "github_mcp_get_workflow_run",
+    "github_mcp_list_artifacts",
 }
 
 
@@ -3861,7 +4337,19 @@ def chat_worker_loop():
                     # session_id = body.get("session_id") # This line was duplicated
 
                     if not job_id or not mail or not content:
-                        # Malformed message; drop it
+                        # If this looks like an incident worker message, release it back
+                        # so the incident worker can process it.
+                        if isinstance(body.get("Mail"), dict) and body.get("Mail", {}).get("inc_number"):
+                            logger.warning(
+                                "Chat worker received a non-chat message. "
+                                f"Releasing it back to queue '{CHAT_QUEUE_NAME}'."
+                            )
+                            try:
+                                message.change_visibility(VisibilityTimeout=0)
+                            except Exception:
+                                pass
+                            continue
+                        # Truly malformed chat message; drop it.
                         message.delete()
                         continue
 
@@ -4910,36 +5398,64 @@ def addSlackCredentials(config: SlackConfig, user_data: dict = Depends(verify_to
         # For now, let's trust the token has email or use user_id as identifier suffix
         identifier = user_email if user_email else user_id
 
+        # Debug logging
+        print(f"DEBUG addSlackCredentials: user_data keys={list(user_data.keys())}")
+        print(f"DEBUG addSlackCredentials: user_email raw='{user_email}', identifier='{identifier}'")
+        print(f"DEBUG addSlackCredentials: slack_bot_token present={bool(config.slack_bot_token)}, slack_channel='{config.slack_channel}'")
+
         # Store in Infisical
         secrets = {
             "SLACK_BOT_TOKEN": config.slack_bot_token,
             "SLACK_CHANNEL": config.slack_channel
         }
-        set_many(identifier, secrets)
+        
+        try:
+            set_many(identifier, secrets)
+        except requests.exceptions.HTTPError as http_err:
+            # Check if it's a 400 error related to the secret name
+            if http_err.response.status_code == 400:
+                # Use full email without sanitization
+                print(f"DEBUG addSlackCredentials: Got 400 error with identifier {identifier}, trying without sanitization...")
+                set_many(identifier, secrets)
+            else:
+                raise
             
         return {"message": "Slack credentials saved to Infisical"}
     except Exception as e:
         print(f"ERROR in addSlackCredentials: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/getSlackCredentials/{mail}")
 def getSlackCredentials(mail: str, user_data: dict = Depends(verify_token)):
     try:
+        # Debug: Log what we're looking for
+        print(f"DEBUG getSlackCredentials: mail={mail}")
+        
         # Retrieve from Infisical using the mail param which should match what was used to save
         # Or verify against token email if strictly enforcing ownership
         
         # NOTE: existing frontend passes email in URL. 
         secrets = get_many(mail, ("SLACK_BOT_TOKEN", "SLACK_CHANNEL"))
         
+        print(f"DEBUG getSlackCredentials: secrets found = {secrets}")
+        
         if not secrets.get("SLACK_BOT_TOKEN"):
              # Return empty or 404? Existing returned {} if not found
+             print(f"DEBUG getSlackCredentials: No SLACK_BOT_TOKEN found for {mail}")
              return {}
 
         return {
-            "slack_bot_token": secrets["SLACK_BOT_TOKEN"],
-            "slack_channel": secrets.get("SLACK_CHANNEL")
+            "response": {
+                "slack_bot_token": secrets["SLACK_BOT_TOKEN"],
+                "slack_channel": secrets.get("SLACK_CHANNEL")
+            }
         }
     except Exception as e:
+        print(f"ERROR in getSlackCredentials: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/addEmailCredentials")
@@ -4979,13 +5495,15 @@ def getEmailCredentials(mail: str, user_data: dict = Depends(verify_token)):
         secrets = get_many(mail, ("SMTP_SERVER", "SMTP_PORT", "SENDER_EMAIL", "SENDER_PASSWORD"))
         
         if not secrets.get("SENDER_EMAIL"):
-             return {}
+             return {"response": {}}
 
         return {
-            "smtp_server": secrets.get("SMTP_SERVER", "smtp.gmail.com"),
-            "smtp_port": int(secrets.get("SMTP_PORT", 587)),
-            "sender_email": secrets["SENDER_EMAIL"],
-            "sender_password": secrets["SENDER_PASSWORD"]
+            "response": {
+                "smtp_server": secrets.get("SMTP_SERVER", "smtp.gmail.com"),
+                "smtp_port": int(secrets.get("SMTP_PORT", 587)),
+                "sender_email": secrets["SENDER_EMAIL"],
+                "sender_password": secrets["SENDER_PASSWORD"]
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -5158,7 +5676,8 @@ def incidentAdd(Req: Incident, background_tasks: BackgroundTasks, user_data: dic
         logger.error(f"Failed to queue notification task: {e}")
 
     # Prepare SQS queue message
-    sqsqueue = session.resource("sqs").get_queue_by_name(QueueName="infraaiqueue.fifo")
+    queue_name = settings.SQS_QUEUE_NAME or "Chatqueue"
+    sqsqueue = session.resource("sqs").get_queue_by_name(QueueName=queue_name)
 
     # Worker requires Mail.inc_number/subject/message
     message_parts = [f"Incident {inc_number}: {Req.short_description}"]
@@ -5202,11 +5721,30 @@ def incidentAdd(Req: Incident, background_tasks: BackgroundTasks, user_data: dic
     content_hash = hashlib.sha256(message_body.encode()).hexdigest()
     unique_id = f"{content_hash}-{uuid.uuid4().hex}"
 
-    sqsqueue.send_message(
-        MessageBody=message_body,
-        MessageGroupId=(inc_number or "infraai").strip()[:128],  # per-incident with safe fallback
-        MessageDeduplicationId=unique_id,
-    )
+    try:
+        send_resp = sqsqueue.send_message(
+            MessageBody=message_body
+        )
+        logger.info(
+            "[incident-enqueued] "
+            f"endpoint=/incidentAdd queue={queue_name} "
+            f"incident={inc_number} user_id={user_id} "
+            f"message_id={send_resp.get('MessageId')}"
+        )
+    except Exception as e:
+        logger.exception(
+            "[incident-enqueue-failed] "
+            f"endpoint=/incidentAdd queue={queue_name} incident={inc_number} "
+            f"user_id={user_id} error={str(e)}"
+        )
+        try:
+            supabase.table("Incidents").update({
+                "state": "Error",
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("inc_number", inc_number).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue incident to SQS queue '{queue_name}'")
 
     return {"response": {"user_id": user_id, "inc_number": inc_number}}
 
@@ -5259,7 +5797,7 @@ def background_analyze_incident(inc_number: str, short_desc: str, job_id: str):
 
 @app.post("/incidents/add")
 def add_incident_v3(Req: Incident, user_data: dict = Depends(verify_token), _: bool = Depends(has_permission("incidents", "write"))):
-    """Create a new incident with job tracking."""
+    """Create a new incident, enqueue it for worker processing, and track job progress."""
     user_id = user_data.get("user_id")
     inc_number = (Req.inc_number or "").strip()
     if not inc_number:
@@ -5299,6 +5837,88 @@ def add_incident_v3(Req: Incident, user_data: dict = Depends(verify_token), _: b
         "progress": 0,
         "details": {"inc_number": inc_number}
     }).execute()
+
+    # Enqueue message for the worker so incidents are auto-processed from SQS.
+    message_parts = [f"Incident {inc_number}: {Req.short_description}"]
+    if Req.source:
+        message_parts.append(f"source={Req.source}")
+    if resolved_service_id:
+        message_parts.append(f"service_id={resolved_service_id}")
+    if resolved_fqdn:
+        message_parts.append(f"fqdn={resolved_fqdn}")
+    message_text = " | ".join(message_parts)
+
+    queue_name = settings.SQS_QUEUE_NAME or "Chatqueue"
+    sqsqueue = session.resource("sqs").get_queue_by_name(QueueName=queue_name)
+    try:
+        send_resp = sqsqueue.send_message(
+            MessageBody=json.dumps(
+                {
+                    "Aws": {
+                        "access_key": "",
+                        "secrete_access": "",
+                        "region": "",
+                        "instance_id": Req.tag_id or "",
+                    },
+                    "Mail": {
+                        "inc_number": inc_number,
+                        "subject": Req.short_description,
+                        "message": message_text,
+                    },
+                    "Meta": {
+                        "job_id": job_id,
+                        "user_id": user_id,
+                        "tag_id": Req.tag_id,
+                        "service_id": resolved_service_id,
+                        "fqdn": resolved_fqdn,
+                        "alert_type": Req.alert_type_id,
+                    },
+                }
+            )
+        )
+        logger.info(
+            "[incident-enqueued] "
+            f"endpoint=/incidents/add queue={queue_name} incident={inc_number} "
+            f"job_id={job_id} user_id={user_id} message_id={send_resp.get('MessageId')}"
+        )
+    except Exception as e:
+        logger.exception(
+            "[incident-enqueue-failed] "
+            f"endpoint=/incidents/add queue={queue_name} incident={inc_number} "
+            f"job_id={job_id} user_id={user_id} error={str(e)}"
+        )
+        try:
+            supabase.table("Incidents").update({
+                "state": "Error",
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("inc_number", inc_number).execute()
+        except Exception:
+            pass
+        try:
+            supabase.table("Jobs").update({
+                "status": "failed",
+                "details": {
+                    "inc_number": inc_number,
+                    "stage": "enqueue_failed",
+                    "queue_name": queue_name,
+                    "error": str(e),
+                }
+            }).eq("id", job_id).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue incident to SQS queue '{queue_name}'")
+
+    try:
+        supabase.table("Jobs").update({
+            "details": {
+                "inc_number": inc_number,
+                "stage": "queued_in_sqs",
+                "queue_name": queue_name,
+                "queue_message_id": send_resp.get("MessageId"),
+            }
+        }).eq("id", job_id).execute()
+    except Exception as e:
+        logger.warning(f"Failed to annotate Job {job_id} with queue metadata: {e}")
 
     return {"response": {"user_id": user_id, "inc_number": inc_number, "job_id": job_id}}
 
@@ -5374,19 +5994,89 @@ def save_datadog_config_v2(config: DatadogConfig, user_data: dict = Depends(veri
 
 @app.get("/integrations/prometheus/config")
 def get_prometheus_config_v2(user_data: dict = Depends(verify_token)):
-    base_url = os.getenv("PROMETHEUS_URL", "")
-    auth_type = os.getenv("PROMETHEUS_AUTH_TYPE", "none")
-    bearer_token = os.getenv("PROMETHEUS_TOKEN", "")
-    masked_token = f"****{bearer_token[-4:]}" if len(bearer_token) > 4 else ""
-    return {"response": {"name": "Default Prometheus", "base_url": base_url, "auth_type": auth_type, "bearer_token": masked_token}}
+    """Return Prometheus datasource configuration for the authenticated user.
+    
+    Fetches from Infisical first (user-scoped secrets), then falls back to Supabase.
+    """
+    try:
+        user_id = user_data["user_id"]
+        user_email = user_data.get("email")
+        if not user_email:
+            user_email = user_data.get("user_id")
+        
+        print(f"DEBUG get_prometheus_config_v2: user_email={user_email}, user_id={user_id}")
+        
+        # FIRST: Try to get from Infisical (user-scoped secrets)
+        try:
+            secrets = get_many(user_email, ("PROMETHEUS_URL", "PROMETHEUS_AUTH_TYPE", "PROMETHEUS_TOKEN"))
+            print(f"DEBUG get_prometheus_config_v2: Infisical secrets = {secrets}")
+            
+            if secrets.get("PROMETHEUS_URL"):
+                bearer_token = secrets.get("PROMETHEUS_TOKEN", "")
+                masked_token = f"****{bearer_token[-4:]}" if bearer_token and len(bearer_token) > 4 else ""
+                return {"response": {
+                    "name": "Default Prometheus", 
+                    "base_url": secrets.get("PROMETHEUS_URL", ""), 
+                    "auth_type": secrets.get("PROMETHEUS_AUTH_TYPE", "none"), 
+                    "bearer_token": masked_token
+                }}
+        except Exception as e:
+            print(f"DEBUG get_prometheus_config_v2: Infisical error: {e}")
+        
+        # SECOND: Fallback to Supabase (legacy storage)
+        print(f"DEBUG get_prometheus_config_v2: Checking Supabase for user_id={user_id}")
+        response = supabase.table("PrometheusConfigs").select("*").eq("user_id", user_id).limit(1).execute()
+        print(f"DEBUG get_prometheus_config_v2: DB response = {response.data}")
+        
+        if response.data:
+            return {"response": response.data[0]}
+        
+        # THIRD: Fallback to environment variables
+        base_url = os.getenv("PROMETHEUS_URL", "")
+        auth_type = os.getenv("PROMETHEUS_AUTH_TYPE", "none")
+        bearer_token = os.getenv("PROMETHEUS_TOKEN", "")
+        masked_token = f"****{bearer_token[-4:]}" if bearer_token and len(bearer_token) > 4 else ""
+        return {"response": {"name": "Default Prometheus", "base_url": base_url, "auth_type": auth_type, "bearer_token": masked_token}}
+        
+    except Exception as e:
+        print(f"DEBUG get_prometheus_config_v2: Error = {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch Prometheus configuration: {str(e)}",
+        )
 
 @app.post("/integrations/prometheus/config")
 def save_prometheus_config_v2(config: PrometheusConfig, user_data: dict = Depends(verify_token)):
-    os.environ["PROMETHEUS_URL"] = config.base_url
-    os.environ["PROMETHEUS_AUTH_TYPE"] = config.auth_type or "none"
-    if config.bearer_token and not config.bearer_token.startswith("****"):
-        os.environ["PROMETHEUS_TOKEN"] = config.bearer_token
-    return {"status": "success"}
+    """Store Prometheus datasource configuration in Infisical (user-scoped secrets)."""
+    try:
+        user_email = user_data.get("email")
+        if not user_email:
+            user_email = user_data.get("user_id")
+        
+        print(f"DEBUG save_prometheus_config_v2: user_email={user_email}")
+        
+        # Store in Infisical using user-scoped secrets
+        secrets = {
+            "PROMETHEUS_URL": config.base_url,
+            "PROMETHEUS_AUTH_TYPE": config.auth_type or "none",
+        }
+        if config.bearer_token and not config.bearer_token.startswith("****"):
+            secrets["PROMETHEUS_TOKEN"] = config.bearer_token
+        
+        print(f"DEBUG save_prometheus_config_v2: Saving secrets = {list(secrets.keys())}")
+        set_many(user_email, secrets)
+        
+        return {"status": "success", "message": "Saved to Infisical"}
+    except Exception as e:
+        print(f"DEBUG save_prometheus_config_v2: Error = {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save Prometheus configuration: {str(e)}",
+        )
 
 def background_sync_task(email: str, user_id: str, job_id: str):
     """Background task to sync CMDB assets from ServiceNow."""
@@ -5440,9 +6130,16 @@ def sync_cmdb_from_servicenow(background_tasks: BackgroundTasks, user_data: dict
 
 @app.get("/jobs/active")
 def get_active_jobs(user_data: dict = Depends(verify_token)):
-    user_id = user_data['user_id']
-    response = supabase.table("Jobs").select("*").eq("user_id", user_id).or_("status.eq.pending,status.eq.running").execute()
-    return {"response": response.data}
+    user_id = user_data["user_id"]
+    try:
+        response = run_supabase_with_timeout(
+            lambda: supabase.table("Jobs").select("*").eq("user_id", user_id).or_("status.eq.pending,status.eq.running").execute(),
+            timeout_s=60,
+            operation_name="jobs_active_query",
+        )
+        return {"response": response.data}
+    except SupabaseTimeoutError:
+        return {"response": [], "warning": "Active jobs query timed out; please retry"}
 
 @app.get("/jobs/{job_id}")
 def get_job_status(job_id: str, user_data: dict = Depends(verify_token)):
@@ -5865,3 +6562,118 @@ def system_health(
             "workers": "active"      
         }
     }
+
+@app.get("/worker/queue-health")
+def worker_queue_health(user_data: dict = Depends(verify_token)):
+    """
+    Quick visibility endpoint to verify worker queue depth and connectivity.
+    """
+    queue_name = settings.SQS_QUEUE_NAME or "Chatqueue"
+    try:
+        sqs = session.resource("sqs")
+        queue = sqs.get_queue_by_name(QueueName=queue_name)
+        queue.reload()
+        attrs = queue.attributes or {}
+
+        return {
+            "queue_name": queue_name,
+            "region": settings.AWS_REGION,
+            "checked_at": datetime.utcnow().isoformat(),
+            "metrics": {
+                "visible": int(attrs.get("ApproximateNumberOfMessages", 0)),
+                "inflight": int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
+                "delayed": int(attrs.get("ApproximateNumberOfMessagesDelayed", 0)),
+            },
+        }
+    except Exception as e:
+        logger.exception(f"Failed to read queue health for {queue_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read queue health: {str(e)}")
+
+
+# --- Incident Streaming Endpoint ---
+
+class IncidentProcessRequest(BaseModel):
+    inc_number: str
+
+
+@app.post("/incident/stream")
+async def process_incident_stream(
+    request: IncidentProcessRequest,
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+    response: Response
+):
+    """
+    Streaming endpoint for processing incidents with real-time tool usage updates.
+    Uses Server-Sent Events (SSE) to stream tool calls and status updates to the client.
+    """
+    from fastapi.responses import StreamingResponse
+    from app.services.incident_service import process_incident_streaming
+    
+    try:
+        token = credentials.credentials
+        res = jwt.decode(token, key=clerk_public_key, algorithms=['RS256'])
+        user_id = res.get('user_id')
+        mail = res.get('email')
+    except jwt.DecodeError as e:
+        print(e)
+        return {"error": "Invalid token"}
+
+    inc_number = request.inc_number
+    
+    async def generate():
+        # Create a queue to hold events
+        event_queue = queue.Queue()
+        
+        def event_callback(event):
+            """Callback to receive tool events and put them in the queue"""
+            try:
+                event_queue.put_nowait(event)
+            except queue.Full:
+                pass
+        
+        # Process incident in a thread pool to not block the async event loop
+        def process_in_thread():
+            try:
+                process_incident_streaming(
+                    inc_number=inc_number,
+                    user_id=user_id,
+                    event_callback=event_callback,
+                    ctx_logger=None
+                )
+            except Exception as e:
+                print(f"Error processing incident: {e}")
+            finally:
+                # Signal completion
+                try:
+                    event_queue.put_nowait({"type": "done", "status": "completed"})
+                except queue.Full:
+                    pass
+        
+        # Start processing in background thread
+        thread = threading.Thread(target=process_in_thread, daemon=True)
+        thread.start()
+        
+        # Stream events to client
+        while True:
+            try:
+                event = event_queue.get(timeout=30)
+                
+                if event.get("type") == "done":
+                    yield f"data: {json.dumps({'type': 'done', 'status': event.get('status', 'completed')})}\\n\\n"
+                    break
+                
+                yield f"data: {json.dumps(event)}\\n\\n"
+                
+            except queue.Empty:
+                # Send keepalive
+                yield f"data: {json.dumps({'type': 'keepalive'})}\\n\\n"
+            except asyncio.CancelledError:
+                # Normal when client disconnects or server is shutting down.
+                break
+            except Exception as e:
+                print(f"Error streaming event: {e}")
+                break
+        
+        # Cleanup - unregister callback (simplified - in production use proper cleanup)
+        
+    return StreamingResponse(generate(), media_type="text/event-stream")
