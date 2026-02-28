@@ -1,254 +1,145 @@
 # Infra AI Backend
 
-## Overview
-Infra AI Backend is a FastAPI-based automation platform for incident management, infrastructure operations, and CMDB/knowledge-base management. It integrates:
+FastAPI service for incident intake, automated remediation workflows, CMDB operations, chat/tool orchestration, and external integrations.
 
-- **Supabase** – primary data store for users, incidents, CMDB, results, knowledge docs, Prometheus configs, and chat history.
-- **AWS** – SQS (incident & chat queues), EC2 (targets), ECS Fargate (Ansible sandbox), S3 & CloudWatch Logs.
-- **Pinecone** – vector knowledge base for SOPs/runbooks.
-- **OpenRouter LLMs** – core reasoning engine (chat, diagnostics, automation, ServiceNow helper).
-- **Infisical** – secret management for per-user AWS, SSH, ServiceNow, GitHub, Jira, Confluence, and PagerDuty credentials.
-- **Redis** – async chat job state and JWT handoff for SSH.
-- **Prometheus** – optional metrics context to guide diagnostics.
-- **ServiceNow** – incident integration (create/update/fetch).
-- **GitHub, Jira, Confluence, PagerDuty** – extended integrations for development, project management, and on-call workflows.
+## What this project provides
 
-The backend exposes both synchronous HTTP APIs and long-running background workers for self-healing incident resolution.
+- Incident ingestion endpoints (`/incidentAdd`, `/incidents/add`)
+- SQS-backed worker processing for incident analysis/remediation
+- Real-time incident execution streams via SSE (`/incident/stream`, `/api/v1/incidents/stream`)
+- CMDB and service inventory APIs
+- Knowledge base ingestion/search APIs
+- Chat APIs with tool integrations (ServiceNow, GitHub, Jira, Confluence, PagerDuty, Prometheus, Datadog)
+- Admin/workflow APIs (approvals, alert types, escalation rules, jobs)
 
----
+## Tech stack
 
-## High-Level Architecture
+- Python 3.11
+- FastAPI
+- Supabase
+- AWS (SQS, optional ECS/S3 for automation sandbox)
+- OpenRouter / Gemini connectors
+- Pinecone
+- Redis
+- Infisical
+- Slack SDK + other integration clients
 
-### Logical Components
+## Repository layout
 
-1. **HTTP API service (FastAPI)**
-   - Main entrypoint: `main.py`
-   - Provides REST endpoints for:
-     - Chat and infra automation
-     - Incident creation and listing
-     - CMDB CRUD
-     - Knowledge-base ingestion & search
-     - Credential management (AWS, SSH, ServiceNow, GitHub, Jira, Confluence, PagerDuty)
-     - Prometheus datasource config
-     - Results and analytics
-   - Starts in-process worker threads for:
-     - SQS incident worker (`worker_loop` from `worker.py`)
-     - SQS async chat worker (`chat_worker_loop` in `main.py`)
+- `main.py`: API entrypoint and route definitions
+- `worker.py`: incident worker loop and queue processing
+- `app/services/incident_service.py`: core remediation logic
+- `app/core/*`: config, auth, middleware, DB client, SSE helpers
+- `integrations/*`: integration adapters (GitHub, Jira, Confluence, PagerDuty, Prometheus, etc.)
+- `migrations/*`: SQL migrations
 
-2. **Incident worker service**
-   - Core implementation: `worker.py`
-   - Polls an AWS SQS FIFO queue for incident jobs
-   - Looks up CMDB and user context in Supabase
-   - Fetches SSH keys and credentials from Infisical
-   - Optionally enriches with Pinecone KB and Prometheus metrics
-   - Uses OpenRouter LLMs to:
-     - Generate a diagnostic plan
-     - Execute diagnostics on the target host via SSH
-     - Analyze diagnostics to determine root cause and resolution steps
-     - Execute resolution commands on the host
-   - Updates Incidents and Results tables in Supabase
-   - Writes detailed structured logs to `infra_worker.log`
+## Prerequisites
 
-3. **Ansible automation sandbox**
-   - Script: `ansible_sandbox.py`
-   - Used indirectly by the `infra_automation_ai` tool in `main.py`
-   - Flow:
-     - The HTTP API asks the LLM to generate:
-       - Ansible module installation shell script
-       - Inventory file
-       - Playbook YAML
-       - Playbook run command
-     - Backend writes these artifacts plus AWS vars and SSH key to local disk
-     - `ansible_sandbox.py` uploads artifacts to S3 and launches an ECS Fargate task using an Ansible runner image
-     - The task pulls artifacts from S3, runs the playbook, and streams logs to CloudWatch Logs
-     - Sandbox output is collected and summarized back to the user
+- Python 3.11+
+- Access to Supabase project and tables used by this service
+- AWS credentials with access to configured SQS queues
+- Clerk setup for JWT issuance/verification
+- Optional but commonly required: OpenRouter, Pinecone, Infisical, Redis
 
-4. **Chat + tools orchestration**
-   - Synchronous `/chat` endpoint
-   - Async `/chat/async` endpoint + `Chatqueue` SQS + Redis job storage
-   - Uses LangChain tools to call:
-     - ServiceNow (create/update/get incident)
-     - CMDB lookup
-     - Knowledge base search (`ask_knowledge_base`)
-     - Infra automation (`infra_automation_ai` → Ansible sandbox)
-     - **GitHub**: Search issues/commits, get details (PR diffs support)
-     - **Jira**: Search/get issues
-     - **Confluence**: Search/get pages
-     - **PagerDuty**: List/get incidents
-     - **Prometheus**: Query metrics
-   - Chat history persisted in Supabase
+## Local setup
 
----
+```bash
+cd infra.ai_backend\ copy
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
 
-## Data & Control Flows
+## Environment variables
 
-### 1. Incident auto-remediation pipeline
+Start from `.env.example` and add real secrets.
 
-1. **Incident creation**
-   - Frontend calls `POST /incidentAdd` on `main.py`.
-   - Supports creation from manual input or PagerDuty webhooks.
-   - Backend inserts a row into the `Incidents` table.
-   - The same request enqueues a message into the AWS SQS FIFO queue `infraaiqueue.fifo` with incident meta and minimal AWS stub config.
+Important: the current code still reads some legacy env names from `app/core/config.py`. To avoid startup surprises, set both normalized and legacy names for these keys:
 
-2. **Incident queue consumption**
-   - The incident worker (`worker_loop`) polls `infraaiqueue.fifo`.
-   - It fetches credentials (AWS, SSH) from Infisical based on the user associated with the incident.
+- OpenRouter: `OPENROUTER_API_KEY` and `openrouter`
+- Pinecone: `PINECONE_API_KEY` and `Pinecone_Api_Key`
+- AWS: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` and `access_key`/`secrete_access`
+- Infisical: `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET` and `clientId`/`clientSecret`
 
-3. **Context enrichment**
-   - CMDB lookup in Supabase via `tag_id` or `instance_id`.
-   - Knowledge base context via Pinecone (SOPs, runbooks).
-   - Prometheus metrics (if configured) queried from the host.
+Core variables typically needed:
 
-4. **Diagnostics & Resolution**
-   - Worker generates a diagnostic plan via LLM.
-   - Executes diagnostics on the host via SSH.
-   - Analyzes results to determine root cause.
-   - Executes resolution steps via SSH.
-   - Updates `Incidents` and `Results` tables in Supabase.
+- `SUPABASE_URL`
+- `SUPABASE_KEY`
+- `SQS_QUEUE_NAME`
+- `WORKER_COUNT`
+- `CHAT_WORKER_COUNT`
+- `OPENROUTER_MODEL`
+- `CLERK_SECRET_KEY`
 
-### 2. Chat and tool orchestration
+## Run locally
 
-1. **Synchronous chat (`POST /chat`)**
-   - Authenticated via JWT.
-   - System prompt enforces `ask_knowledge_base` first.
-   - Tools available include ServiceNow, CMDB, Infra Automation, and the new integrations (GitHub, Jira, Confluence, PagerDuty).
+```bash
+fastapi dev main.py --host 0.0.0.0 --port 8000
+```
 
-2. **Async chat (`POST /chat/async`)**
-   - Enqueues request into `Chatqueue`.
-   - Processed by `chat_worker_loop` which stores results in Redis.
-   - Client polls `GET /chat/async/{job_id}` for status.
+Alternative:
 
----
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
 
-## Features & Integrations
+OpenAPI docs:
 
-### Core Features
-- **Auto-Remediation**: Self-healing for infrastructure incidents via SSH and Ansible.
-- **RAG Knowledge Base**: Ingest SOPs (PDF/Text) and Architecture docs into Pinecone for context-aware answers.
-- **CMDB**: Manage assets and link them to owners and incidents.
-- **Infra Automation**: Natural language to Ansible playbook generation and execution in a sandboxed ECS environment.
+- `http://localhost:8000/docs`
 
-### Extended Integrations
-New integrations allow the agent to interact with your wider DevOps ecosystem. Credentials for these are securely stored in Infisical per-user.
+## Worker behavior
 
-- **GitHub**:
-  - Search issues and commits (`/integrations/github/issues/search`, `/integrations/github/commits/search`).
-  - Get detailed issue/PR info including diffs.
-- **Jira**:
-  - Search issues via JQL (`/integrations/jira/issues/search`).
-  - Get issue details.
-- **Confluence**:
-  - Search pages via CQL (`/integrations/confluence/pages/search`).
-  - Retrieve page content.
-- **PagerDuty**:
-  - List incidents by status (`/integrations/pagerduty/incidents`).
-  - Get incident details.
-- **Prometheus**:
-  - Configure datasources (`/prometheus/config`).
-  - Execute instant queries (`/integrations/prometheus/query`).
+- Incidents are inserted, then enqueued to SQS from `/incidentAdd` or `/incidents/add`
+- Worker loop consumes queue messages and updates incidents/jobs/results
+- Worker and chat worker thread counts are controlled by:
+  - `WORKER_COUNT`
+  - `CHAT_WORKER_COUNT`
 
----
+## Key API groups
 
-## API Endpoints Summary
+- Incidents:
+  - `POST /incidentAdd`
+  - `POST /incidents/add`
+  - `GET /allIncidents`
+  - `GET /getIncidentsDetails/{inc_number}`
+  - `GET /getResults/{inc_number}`
+- Streaming:
+  - `POST /incident/stream`
+  - `GET /api/v1/incidents/stream/{inc_number}`
+- Chat:
+  - `POST /chat`
+  - `POST /chat/stream`
+  - `POST /chat/async`
+  - `GET /chat/async/{job_id}`
+- CMDB/Services:
+  - `GET/POST /cmdb`
+  - `GET/PUT/DELETE /cmdb/{tag_id}`
+  - `GET/POST /services`
+- Admin/Workflow:
+  - `GET/POST/PUT/DELETE /alert-types`
+  - `GET/POST/PUT/DELETE /escalation-rules`
+  - `POST /pending-actions/{action_id}/approve|reject`
 
-### Knowledge Base
-- `POST /addKnowledge`: Ingest SOP/Docs.
-- `POST /knowledge/architecture`: Ingest global architecture docs.
-- `GET /getKnowledge`: Query KB.
-- `GET /knowledge/docs`: List user's KB docs.
-- `DELETE /knowledge/{doc_id}`: Remove a doc.
+## Migrations
 
-### CMDB
-- `GET /cmdb`: List all items.
-- `POST /cmdb`: Create item.
-- `GET /cmdb/{tag_id}`: Get item.
-- `PUT /cmdb/{tag_id}`: Update item.
-- `DELETE /cmdb/{tag_id}`: Delete item.
-
-### Incidents & Queue
-- `POST /incidentAdd`: Create incident (Manual/PagerDuty).
-- `POST /queueAdd`, `/queueRemove`: Direct SQS control (low-level).
-- `POST /storeResult`: Manually store resolution results.
-- `GET /getResults/{inc_number}`: Retrieve results.
-
-### Integrations Config & Actions
-Each integration (GitHub, Jira, Confluence, PagerDuty, Prometheus) has:
-- `GET .../config`: Retrieve current config (masked).
-- `POST .../config`: Update config (stored in Infisical).
-- Specific action endpoints (e.g., searches, queries).
-
----
-
-## Environment Configuration
-
-The backend relies on environment variables. Create a `.env` file:
-
-### Core Platform
-- `SUPABASE_URL` – Supabase project URL
-- `SUPABASE_KEY` – Supabase service/anon key
-- `openrouter` – OpenRouter API key
-- `OPENROUTER_MODEL` – Default chat model (e.g., `openai/gpt-5.2`)
-- `Pinecone_Api_Key` – Pinecone API key
-- `PINECONE_KB_INDEX_NAME` – Default `infraai`
-
-### Worker Configuration
-- `SQS_QUEUE_NAME` – Default `infraaiqueue.fifo`
-- `CHAT_QUEUE_NAME` – Default `Chatqueue`
-- `WORKER_COUNT` – Incident worker threads (default 1)
-- `CHAT_WORKER_COUNT` – Chat worker threads (default 1)
-
-### AWS & Sandbox
-- `access_key`, `secrete_access`, `region` – AWS credentials for the backend process itself (for SQS/S3/ECS control).
-- `account_id` – AWS Account ID for ECR.
-
-### Secrets & Integrations (Infisical)
-- `clientId`, `clientSecret` – Infisical universal auth credentials.
-- **Per-User Integration Secrets**: The backend uses these credentials to fetch per-user keys from Infisical workspace.
-  - Users configure their keys (Github Token, Jira API Token, etc.) via the `/integrations/.../config` endpoints, which the backend saves to Infisical.
-
-### Auth
-- `clerk_public_key` – Embedded RSA key for verifying frontend JWTs.
-
----
-
-## Running Locally
-
-1. **Install Dependencies**:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-2. **Start Redis**:
-   ```bash
-   redis-server
-   ```
-
-3. **Run API**:
-   ```bash
-   fastapi dev main.py --host 0.0.0.0 --port 8000
-   ```
-
-4. **Run Worker (Optional)**:
-   If not using in-process threads:
-   ```bash
-   python worker.py
-   ```
-
----
+SQL migrations are in `migrations/`. Apply them in your DB deployment pipeline before rolling out new backend code.
 
 ## Docker
 
-Build and run the backend:
 ```bash
-docker build -t infraai-backend .
-docker run --env-file .env -p 8000:8000 infraai-backend
+docker build -t infra-ai-backend .
+docker run --env-file .env -p 8000:8000 infra-ai-backend
 ```
 
----
+## Logs and troubleshooting
 
-## Security
-- **Secret Zero**: Only Infisical client secrets are stored in the backend env. All downstream integration keys (AWS, SSH, GitHub, etc.) are fetched dynamically per user.
-- **Sandboxing**: Ansible runs in isolated ECS Fargate tasks.
-- **PII/Context**: Logs are structured and truncated to avoid leaking sensitive prompt data.
+- Main log files commonly used during local runs:
+  - `infra_backend.log`
+  - `infra_worker.log`
+- Queue health endpoint:
+  - `GET /worker/queue-health`
+- If incidents stay queued:
+  - Verify `SQS_QUEUE_NAME`
+  - Verify AWS credentials and queue permissions
+  - Verify worker threads are running
