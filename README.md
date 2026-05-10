@@ -143,3 +143,14 @@ docker run --env-file .env -p 8000:8000 infra-ai-backend
   - Verify `SQS_QUEUE_NAME`
   - Verify AWS credentials and queue permissions
   - Verify worker threads are running
+
+## Demo and screenshots
+
+
+
+https://github.com/user-attachments/assets/4da34f15-ea2c-48da-90ce-59e0e490b84a
+
+
+
+<img width="1436" height="745" alt="Screenshot 2026-02-20 at 4 19 30 PM" src="https://github.com/user-attachments/assets/05feae48-82be-4fbe-bedf-3bbf5f12deda" />
+
