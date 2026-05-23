@@ -24,6 +24,40 @@ FastAPI service for incident intake, automated remediation workflows, CMDB opera
 - Infisical
 - Slack SDK + other integration clients
 
+## Architecture overview
+
+The backend centers on a FastAPI service that accepts chat and incident traffic, coordinates queue workers, streams updates to the frontend, and publishes work to supporting systems.
+
+```mermaid
+flowchart LR
+    EventGen["External Event Generator"] --> IncidentQueue["sqs_incident_queue"]
+    Frontend["Frontend"] -->|"Chat request"| Backend["Main Backend"]
+    Backend -->|"SSE connection"| Frontend
+    IncidentQueue -->|"Polling"| Backend
+    Backend -->|"enqueue chat_request"| ChatQueue["chat_queue"]
+    Backend -->|"enqueue incidents"| RMQ["RMQ"]
+    Backend <-->|"Pub/sub"| Redis["Redis"]
+    Backend --> Vault["Vault"]
+    Backend --> DB["DB"]
+    Worker1["Worker 1"] -->|"pub"| Redis
+    Worker2["Worker 2"] -->|"pub"| Redis
+    Worker3["Worker 3"] -->|"pub"| Redis
+    Redis --> DB
+    Vault --> Worker1
+    Vault --> Worker2
+    Vault --> Worker3
+    RMQ -->|"polling"| Worker3
+```
+
+### Runtime responsibilities
+
+- `Frontend` sends chat and incident requests and listens for live SSE updates.
+- `Main Backend` orchestrates queueing, persistence, secret access, and worker coordination.
+- `Redis` acts as the pub/sub backbone for worker updates.
+- `Vault` provides credentials and secret material to the backend and workers.
+- `RMQ`, `chat_queue`, and `sqs_incident_queue` decouple intake from asynchronous processing.
+- `DB` stores incidents, workflow state, and generated outputs.
+
 ## Repository layout
 
 - `main.py`: API entrypoint and route definitions
@@ -49,6 +83,12 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+```
+
+For local validation tooling:
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 ## Environment variables
@@ -132,6 +172,20 @@ docker build -t infra-ai-backend .
 docker run --env-file .env -p 8000:8000 infra-ai-backend
 ```
 
+## Testing and delivery
+
+Local quality checks:
+
+```bash
+ruff format --check app/core/logger.py app/core/sse_manager.py app/core/supabase_timeout.py tests
+pytest
+```
+
+GitHub Actions pipeline:
+
+- `test` job installs `requirements-dev.txt`, checks formatting, and runs the pytest suite on pull requests and pushes to `main`.
+- `docker` job runs after tests pass on `main` and publishes a Docker image to GitHub Container Registry at `ghcr.io/<owner>/infra-ai-backend`.
+
 ## Logs and troubleshooting
 
 - Main log files commonly used during local runs:
@@ -153,4 +207,3 @@ https://github.com/user-attachments/assets/4da34f15-ea2c-48da-90ce-59e0e490b84a
 
 
 <img width="1436" height="745" alt="Screenshot 2026-02-20 at 4 19 30 PM" src="https://github.com/user-attachments/assets/05feae48-82be-4fbe-bedf-3bbf5f12deda" />
-

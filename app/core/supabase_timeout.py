@@ -11,7 +11,7 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SUPABASE_TIMEOUT_WORKE
 
 
 class SupabaseTimeoutError(TimeoutError):
-    pass
+    """Raised when a blocking Supabase operation exceeds the configured timeout."""
 
 
 def run_supabase_with_timeout(
@@ -24,11 +24,12 @@ def run_supabase_with_timeout(
     Execute a blocking Supabase call in a worker thread with a hard timeout.
     Prevents request handlers from hanging forever when network/DB is slow.
     """
+
     future = _EXECUTOR.submit(operation)
     try:
         return future.result(timeout=timeout_s)
-    except FuturesTimeoutError as e:
+    except FuturesTimeoutError as exc:
         future.cancel()
-        msg = f"{operation_name} timed out after {timeout_s}s"
-        logger.error(msg)
-        raise SupabaseTimeoutError(msg) from e
+        message = f"{operation_name} timed out after {timeout_s}s"
+        logger.error(message)
+        raise SupabaseTimeoutError(message) from exc

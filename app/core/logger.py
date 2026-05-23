@@ -1,19 +1,18 @@
-import logging
 import json
+import logging
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional
 
+
 class JSONFormatter(logging.Formatter):
-    """
-    Formatter that outputs JSON strings after parsing the LogRecord.
-    """
+    """Serialize log records into a compact JSON payload."""
+
     def format(self, record: logging.LogRecord) -> str:
         message = record.getMessage()
-        
         log_record = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "level": record.levelname,
             "logger": record.name,
             "message": message,
@@ -22,54 +21,59 @@ class JSONFormatter(logging.Formatter):
             "lineno": record.lineno,
         }
 
-        # Add any extra attributes passed in extra={}
-        # We explicitly look for 'props' which is our convention for structured data
         if hasattr(record, "props"):
             log_record.update(record.props)
 
-        # Handle exceptions
         if record.exc_info:
             log_record["exception"] = self.formatException(record.exc_info)
 
         return json.dumps(log_record)
 
-def setup_logger(name: str = "infra_backend", log_file: str = "infra_backend.log", level: str = "INFO"):
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
 
-    # Clear existing handlers
-    if logger.hasHandlers():
-        logger.handlers.clear()
+def setup_logger(
+    name: str = "infra_backend",
+    log_file: str = "infra_backend.log",
+    level: str = "INFO",
+):
+    """Create a logger with JSON output for stdout and optional file rotation."""
+
+    configured_logger = logging.getLogger(name)
+    configured_logger.setLevel(level)
+
+    if configured_logger.hasHandlers():
+        configured_logger.handlers.clear()
 
     formatter = JSONFormatter()
 
-    # Console Handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    configured_logger.addHandler(console_handler)
 
-    # File Handler
     if log_file:
-        fh = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+        )
+        file_handler.setFormatter(formatter)
+        configured_logger.addHandler(file_handler)
 
-    return logger
+    return configured_logger
 
-# Global logger instance
+
 logger = setup_logger()
 
+
 def audit_log(
-    action: str, 
-    user_id: Any, 
-    resource: str, 
-    details: Optional[Dict[str, Any]] = None, 
+    action: str,
+    user_id: Any,
+    resource: str,
+    details: Optional[Dict[str, Any]] = None,
     status: str = "success",
-    level: str = "INFO"
+    level: str = "INFO",
 ):
-    """
-    Helper to log audit events in a standardized way.
-    """
+    """Log audit events with a consistent structure."""
+
     props = {
         "event_type": "audit",
         "action": action,
@@ -79,32 +83,40 @@ def audit_log(
     }
     if details:
         props["details"] = details
-        
-    msg = f"Audit: User {user_id} performed {action} on {resource} ({status})"
-    
-    if level.upper() == "INFO":
-        logger.info(msg, extra={"props": props})
-    elif level.upper() == "WARNING":
-        logger.warning(msg, extra={"props": props})
+
+    message = f"Audit: User {user_id} performed {action} on {resource} ({status})"
+
+    if level.upper() == "WARNING":
+        logger.warning(message, extra={"props": props})
     elif level.upper() == "ERROR":
-        logger.error(msg, extra={"props": props})
+        logger.error(message, extra={"props": props})
     else:
-        logger.info(msg, extra={"props": props})
+        logger.info(message, extra={"props": props})
+
 
 def make_ctx_logger(base_logger, incident=None, instance=None, user=None):
-    """
-    Create a context-aware logger adapter.
-    """
-    prefix = f"[incident={incident or 'unknown'}] [instance={instance or 'unknown'}] [user={user or 'unknown'}]"
-    class Ctx:
+    """Create a lightweight context-aware logger wrapper."""
+
+    prefix = (
+        f"[incident={incident or 'unknown'}] "
+        f"[instance={instance or 'unknown'}] "
+        f"[user={user or 'unknown'}]"
+    )
+
+    class CtxLogger:
         def info(self, msg, *args, **kwargs):
             base_logger.info(f"{prefix} {msg}", *args, **kwargs)
+
         def debug(self, msg, *args, **kwargs):
             base_logger.debug(f"{prefix} {msg}", *args, **kwargs)
+
         def warning(self, msg, *args, **kwargs):
             base_logger.warning(f"{prefix} {msg}", *args, **kwargs)
+
         def error(self, msg, *args, **kwargs):
             base_logger.error(f"{prefix} {msg}", *args, **kwargs)
+
         def exception(self, msg, *args, **kwargs):
             base_logger.exception(f"{prefix} {msg}", *args, **kwargs)
-    return Ctx()
+
+    return CtxLogger()
