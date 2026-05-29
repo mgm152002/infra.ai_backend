@@ -121,7 +121,7 @@ from integrations.pagerduty import (
     pagerduty_get_incident as pagerduty_get_incident_impl,
 )
 from integrations.prometheus import prometheus_instant_query
-from app.integrations.servicenow import servicenow_client
+from integrations.servicenow import servicenow_client
 from integrations.infisical import set_many, get_many
 from datetime import timezone
 
@@ -341,9 +341,15 @@ from app.api.routers import admin
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
 from app.api.routers import sse
 app.include_router(sse.router, prefix="/api/v1", tags=["SSE"])
+from app.api.routers import incidents as incidents_router
+app.include_router(incidents_router.router, tags=["Incidents"])
+from app.api.routers import chat as chat_router_mod
+app.include_router(chat_router_mod.router, tags=["Chat"])
+from app.api.routers import integrations_config
+app.include_router(integrations_config.router, tags=["Integrations"])
 
 # Load Slack client on startup if configured
-from app.integrations.slack import slack_client
+from integrations.slack import slack_client
 
 security = HTTPBearer()
 import os
@@ -545,14 +551,14 @@ AVAILABLE TOOLS AND WHEN TO USE THEM
   - Use to update a local incident in the database.
   - Provide updates as a dictionary (e.g., {'state': 'InProgress'}).
 
-- `infra_automation_ai(mesaage, mail)`
+- `infra_automation_ai(message, mail)`
   - CRITICAL TOOL: Use whenever the request involves infrastructure changes, server actions, or SOP-style manual steps
     (for example: "install docker on this EC2 instance", "go to the AWS console and create a VM", "log in to the server and run these commands").
   - This tool converts instructions into Ansible-based automation and executes them in the user's AWS environment.
   - It retrieves AWS credentials and SSH keys from Infisical automatically.
   - The tool generates Ansible playbooks, installs required modules via ansible-galaxy, creates inventory files, and executes the playbooks remotely.
   - Returns playbook output (stdout) and any errors (stderr) encountered during execution.
-  - Pass the full user request (and any relevant SOP text) as `mesaage`.
+  - Pass the full user request (and any relevant SOP text) as `message`.
 
 - `create_incident(create, mail)`, `update_incident(incident_number, updates, mail)`, `get_incident_details(incident_number, mail)`
   - Use for ServiceNow-style incident creation, updates, and lookups.
@@ -1621,6 +1627,34 @@ def upload_architecture_knowledge(
                 detail=f"Failed to persist architecture knowledge file: {str(fs_err)}",
             )
 
+        # Persist architecture document metadata in Supabase so the frontend can
+        # list it alongside regular knowledge documents.
+        try:
+            existing_arch = (
+                supabase.table("KnowledgeBaseDocs")
+                .select("id")
+                .eq("doc_id", ARCHITECTURE_KB_DOC_ID)
+                .eq("user_id", _user_id)
+                .limit(1)
+                .execute()
+            )
+            arch_row = {
+                "user_id": _user_id,
+                "email": email,
+                "doc_id": ARCHITECTURE_KB_DOC_ID,
+                "source_file_name": file.filename,
+                "chunks_indexed": kb_result["chunks_indexed"],
+                "index_name": PINECONE_KB_INDEX_NAME,
+            }
+            if existing_arch.data:
+                supabase.table("KnowledgeBaseDocs").update(arch_row).eq(
+                    "id", existing_arch.data[0]["id"]
+                ).execute()
+            else:
+                supabase.table("KnowledgeBaseDocs").insert(arch_row).execute()
+        except Exception:
+            pass
+
         return {
             "status": "ok",
             "message": "Architecture knowledge base updated",
@@ -1635,6 +1669,27 @@ def upload_architecture_knowledge(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to store architecture knowledge: {str(e)}",
+        )
+
+
+@app.get("/knowledge/architecture/docs", response_model=dict)
+async def list_architecture_documents(user_data: dict = Depends(verify_token)):
+    """List architecture documents ingested via /knowledge/architecture for the authenticated user."""
+    try:
+        user_id = user_data["user_id"]
+        response = (
+            supabase.table("KnowledgeBaseDocs")
+            .select("id, doc_id, source_file_name, chunks_indexed, index_name, created_at")
+            .eq("user_id", user_id)
+            .eq("doc_id", ARCHITECTURE_KB_DOC_ID)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch architecture documents: {str(e)}",
         )
 
 
@@ -2821,7 +2876,7 @@ def search_cmdb(query: str, mail: str):
         return {"status": "error", "message": str(e)}
 
 @tool
-def infra_automation_ai(mesaage:str,mail:str):
+def infra_automation_ai(message:str,mail:str):
     '''Automate infrastructure-related tasks for the authenticated user.
 
     Use this tool whenever the user request or SOP describes infrastructure changes or
@@ -2885,7 +2940,7 @@ GENERAL BEHAVIOR:
 - If the user request conflicts with these rules, follow these system rules first.
 """
         ),
-        HumanMessage(content=mesaage),
+        HumanMessage(content=message),
     ]
     ai_msg = llm.invoke(messages)
     infra_ai = ai_msg.content
@@ -3609,7 +3664,7 @@ def get_problem_record_details(
              prob_ids = [r['id'] for r in records]
              if prob_ids:
                 # We need to select problem_id to map them back
-                inc_query = supabase.table("Incidents").select("inc_number, description, state, problem_id").in_("problem_id", prob_ids).execute()
+                inc_query = supabase.table("Incidents").select("inc_number, short_description, state, problem_id").in_("problem_id", prob_ids).execute()
                 
                 for rec in records:
                     rec['linked_incidents'] = [inc for inc in inc_query.data if inc.get('problem_id') == rec['id']]

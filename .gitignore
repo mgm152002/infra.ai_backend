@@ -3,3 +3,14 @@
 *.log
 *.rdb
 key.pem
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+htmlcov/
+.coverage
+dist/
+build/
+*.egg-info/
+.DS_Store
+*.log.1

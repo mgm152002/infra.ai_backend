@@ -1,7 +1,7 @@
 import logging
 from app.core.database import supabase
-from app.integrations.slack import SlackIntegration
-from app.integrations.email import EmailIntegration
+from integrations.slack import SlackIntegration
+from integrations.email import EmailIntegration
 
 logger = logging.getLogger(__name__)
 
