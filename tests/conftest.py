@@ -1,7 +1,31 @@
 """Shared pytest fixtures for infra-ai-backend tests."""
 
+import os
+import sys
+
 import pytest
 from unittest.mock import MagicMock, patch
+
+# --- Import-time test environment and dependency stubs ---
+
+os.environ["SUPABASE_URL"] = "https://test.supabase.co"
+os.environ["SUPABASE_KEY"] = "test-key"
+os.environ["AWS_REGION"] = "us-east-1"
+os.environ["SQS_QUEUE_NAME"] = "test-queue"
+os.environ["ENCRYPTION_KEY"] = "dGVzdC1rZXktZm9yLXRlc3Rpbmctb25seS0xMjM0NTY3OA=="
+os.environ["Pinecone_Api_Key"] = "test-pinecone-key"
+os.environ["PINECONE_API_KEY"] = "test-pinecone-key"
+os.environ["openrouter"] = "test-openrouter-key"
+
+_pinecone_plugins_mock = MagicMock()
+sys.modules["pinecone_plugins"] = _pinecone_plugins_mock
+sys.modules["pinecone_plugins.assistant"] = _pinecone_plugins_mock.assistant
+sys.modules["pinecone_plugins.assistant.models"] = _pinecone_plugins_mock.assistant.models
+sys.modules["pinecone_plugins.assistant.models.chat"] = _pinecone_plugins_mock.assistant.models.chat
+
+_langchain_openai_mock = MagicMock()
+_langchain_openai_mock.ChatOpenAI = MagicMock
+sys.modules["langchain_openai"] = _langchain_openai_mock
 
 # --- Mock Supabase.create_client (real module loads, just mock the client creation) ---
 
