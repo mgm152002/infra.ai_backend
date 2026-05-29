@@ -60,12 +60,18 @@ flowchart LR
 
 ## Repository layout
 
-- `main.py`: API entrypoint and route definitions
+- `main.py`: FastAPI application entrypoint and top-level app wiring
 - `worker.py`: incident worker loop and queue processing
-- `app/services/incident_service.py`: core remediation logic
-- `app/core/*`: config, auth, middleware, DB client, SSE helpers
-- `integrations/*`: integration adapters (GitHub, Jira, Confluence, PagerDuty, Prometheus, etc.)
-- `migrations/*`: SQL migrations
+- `app/api/routers/`: modular API routers for incidents, chat, SSE, admin, workflow, and integration config
+- `app/core/`: config, auth/security, middleware, DB access, logging, encryption, and SSE helpers
+- `app/schemas/`: shared request/response and domain schemas
+- `app/services/`: incident, notification, and RCA service logic
+- `integrations/`: adapters for ServiceNow, GitHub, Jira, Confluence, PagerDuty, Prometheus, Slack, Infisical, and related tools
+- `migrations/`: SQL migrations for RBAC, CMDB, integrations, jobs, incidents, workflow, and performance indexes
+- `scripts/`: operational helpers, including the Ansible sandbox runner
+- `tests/`: unit, integration, service, and verification tests
+- `docs/`: backend-specific architecture and feature notes
+- `Deployment/` and `Dockerfiles/`: legacy/deployment automation assets
 
 ## Prerequisites
 
@@ -78,7 +84,7 @@ flowchart LR
 ## Local setup
 
 ```bash
-cd infra.ai_backend\ copy
+cd infra-ai-backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
