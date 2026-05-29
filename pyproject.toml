@@ -4,6 +4,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+plugins = ["pytest_plugins"]
 
 [tool.ruff]
 line-length = 100
