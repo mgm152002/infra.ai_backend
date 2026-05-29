@@ -1,27 +1,56 @@
-"""Shared pytest fixtures for infra-ai-backend tests."""
+"""Shared pytest fixtures for infra-ai-backend tests.
 
-import pytest
+CRITICAL: This file runs BEFORE test collection. All mocking must happen
+at module level before any app imports.
+"""
+
+import os
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+# Ensure project root is on sys.path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# --- CRITICAL: Set env vars BEFORE any imports ---
+
+os.environ["SUPABASE_URL"] = "https://test.supabase.co"
+os.environ["SUPABASE_KEY"] = "test-key"
+os.environ["AWS_REGION"] = "us-east-1"
+os.environ["SQS_QUEUE_NAME"] = "test-queue"
+os.environ["ENCRYPTION_KEY"] = "dGVzdC1rZXktZm9yLXRlc3Rpbmctb25seS0xMjM0NTY3OA=="
+
+# --- CRITICAL: Mock missing dependencies BEFORE importing app ---
+
+# Mock pinecone_plugins (not installed in CI)
+_pinecone_mock = MagicMock()
+sys.modules["pinecone_plugins"] = _pinecone_mock
+sys.modules["pinecone_plugins.assistant"] = _pinecone_mock.assistant
+sys.modules["pinecone_plugins.assistant.models"] = _pinecone_mock.assistant.models
+sys.modules["pinecone_plugins.assistant.models.chat"] = _pinecone_mock.assistant.models.chat
+
+# Mock langchain_openai (optional dependency)
+_langchain_mock = MagicMock()
+_langchain_mock.ChatOpenAI = MagicMock
+sys.modules["langchain_openai"] = _langchain_mock
 
 # --- Mock Supabase.create_client AFTER the real module loads ---
 
-_create_client_patch = None
+_supabase_patch = patch("supabase.create_client", return_value=MagicMock())
+_supabase_patch.start()
 
-
-def pytest_configure(config):
-    """Called before test collection - mock supabase.create_client."""
-    global _create_client_patch
-    _create_client_patch = patch(
-        "supabase.create_client",
-        return_value=MagicMock(),
-    )
-    _create_client_patch.start()
+# Import pytest AFTER mocks are in place
+import pytest  # noqa: E402
 
 
 def pytest_unconfigure(config):
     """Called after all tests complete."""
-    if _create_client_patch:
-        _create_client_patch.stop()
+    _supabase_patch.stop()
+
+
+# --- Mock Supabase classes ---
 
 
 class MockSupabaseResponse:
