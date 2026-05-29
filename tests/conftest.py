@@ -1,25 +1,24 @@
 """Shared pytest fixtures for infra-ai-backend tests."""
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# --- Mock environment variables BEFORE any app imports ---
-import os
+# --- CRITICAL: Set env vars BEFORE any imports ---
 
-os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
-os.environ.setdefault("SUPABASE_KEY", "test-key")
-os.environ.setdefault("AWS_REGION", "us-east-1")
-os.environ.setdefault("SQS_QUEUE_NAME", "test-queue")
+os.environ["SUPABASE_URL"] = "https://test.supabase.co"
+os.environ["SUPABASE_KEY"] = "test-key"
+os.environ["AWS_REGION"] = "us-east-1"
+os.environ["SQS_QUEUE_NAME"] = "test-queue"
+os.environ["ENCRYPTION_KEY"] = "dGVzdC1rZXktZm9yLXRlc3Rpbmctb25seS0xMjM0NTY3OA=="
 
-# --- Mock Supabase client at module level ---
+# --- Mock Supabase classes ---
 
 
 class MockSupabaseResponse:
@@ -93,19 +92,54 @@ class MockSupabaseClient:
         return MockSupabaseQuery(self._return_data)
 
 
-# Patch create_client before any app imports
-_patch = patch(
-    "supabase.create_client",
-    return_value=MockSupabaseClient()
+def _create_mock_client(*args, **kwargs):
+    """Factory function for mock Supabase client."""
+    return MockSupabaseClient()
+
+
+# --- Apply mocks BEFORE importing anything from app ---
+
+# Patch 1: supabase.create_client function
+_supabase_create_patch = patch("supabase.create_client", side_effect=_create_mock_client)
+_supabase_create_patch.start()
+
+# Patch 2: supabase.Client class directly
+_supabase_client_patch = patch("supabase.Client", MockSupabaseClient)
+_supabase_client_patch.start()
+
+# Patch 3: The module where database.py imports from
+_db_module_patch = patch(
+    "app.core.database.create_client", side_effect=_create_mock_client
 )
-_patch.start()
+_db_module_patch.start()
+
+# Now safe to import pytest
+import pytest  # noqa: E402
+
+
+def pytest_configure(config):
+    """Called before test collection - ensure mocks are in place."""
+    # Re-apply patches to ensure they're active
+    if not _supabase_create_patch.is_local:
+        _supabase_create_patch.start()
+    if not _supabase_client_patch.is_local:
+        _supabase_client_patch.start()
+    if not _db_module_patch.is_local:
+        _db_module_patch.start()
+
+
+def pytest_unconfigure(config):
+    """Called after all tests complete."""
+    _supabase_create_patch.stop()
+    _supabase_client_patch.stop()
+    _db_module_patch.stop()
 
 
 @pytest.fixture(scope="session", autouse=True)
-def mock_supabase_client():
-    """Ensure supabase client is mocked for entire test session."""
+def setup_mocks():
+    """Ensure mocks stay active for entire test session."""
     yield
-    _patch.stop()
+    # Mocks stopped in pytest_unconfigure
 
 
 @pytest.fixture
