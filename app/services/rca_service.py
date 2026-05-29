@@ -28,7 +28,6 @@ class RCAService:
             context_str = f"Incident Details:\n"
             context_str += f"- ID: {incident.get('inc_number')}\n"
             context_str += f"- Short Description: {incident.get('short_description', 'N/A')}\n"
-            context_str += f"- Description: {incident.get('description', 'N/A')}\n"
             context_str += f"- State: {incident.get('state', 'Unknown')}\n"
             context_str += f"- Created At: {incident.get('created_at', 'Unknown')}\n\n"
             

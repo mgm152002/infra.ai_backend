@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from app.core.logger import logger, make_ctx_logger
 from app.services.incident_service import process_incident, process_incident_streaming, emit_sse_incident_event
 from app.core.config import settings
-from app.db.session import supabase # Importing supabase for Job updates
+from app.core.database import supabase # Importing supabase for Job updates
 from integrations.infisical import get_default_slack_channel
 from integrations.slack import SlackIntegration
 
