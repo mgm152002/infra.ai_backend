@@ -1,4 +1,5 @@
 """Tests for app.core.supabase_timeout module."""
+
 import pytest
 from unittest.mock import MagicMock, patch
 import time
@@ -22,6 +23,7 @@ class TestSupabaseTimeout:
 
     def test_raises_timeout_error(self):
         """Should raise SupabaseTimeoutError when query exceeds timeout."""
+
         def slow_query():
             time.sleep(10)
             return MagicMock()
@@ -31,6 +33,7 @@ class TestSupabaseTimeout:
 
     def test_propagates_query_exception(self):
         """Should propagate exceptions from the query function."""
+
         def failing_query():
             raise ValueError("Database connection failed")
 
@@ -39,6 +42,7 @@ class TestSupabaseTimeout:
 
     def test_operation_name_in_error(self):
         """Operation name should appear in timeout error message."""
+
         def slow_query():
             time.sleep(10)
             return MagicMock()

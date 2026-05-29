@@ -1,4 +1,5 @@
 """Tests for app.core.security module."""
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -38,9 +39,11 @@ class TestSecurity:
     def test_verify_token_function_exists(self):
         """verify_token should be importable."""
         from app.core.security import verify_token
+
         assert verify_token is not None
 
     def test_get_current_user_function_exists(self):
         """get_current_user should be importable."""
         from app.core.security import get_current_user
+
         assert get_current_user is not None

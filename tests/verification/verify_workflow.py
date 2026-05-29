@@ -7,6 +7,7 @@ load_dotenv()
 
 API_URL = "http://localhost:8000/api/v1/workflow"
 
+
 def test_alert_types():
     print("Testing Alert Types...")
     # Create
@@ -32,15 +33,16 @@ def test_alert_types():
     except Exception as e:
         print(f"  [FAIL] List Alert Types: {e}")
 
+
 def test_change_management():
     print("\nTesting Change Management...")
     # Create
     payload = {
-        "title": "Upgrade DB", 
-        "description": "Upgrading postgres", 
+        "title": "Upgrade DB",
+        "description": "Upgrading postgres",
         "requester_id": "test_user",
         "priority": "high",
-        "scheduled_at": "2023-12-25T10:00:00"
+        "scheduled_at": "2023-12-25T10:00:00",
     }
     try:
         res = requests.post(f"{API_URL}/change-requests", json=payload)
@@ -48,9 +50,10 @@ def test_change_management():
             print("  [PASS] Create Change Request")
             # print(res.json())
         else:
-             print(f"  [FAIL] Create Change Request: {res.status_code} {res.text}")
+            print(f"  [FAIL] Create Change Request: {res.status_code} {res.text}")
     except Exception as e:
         print(f"  [FAIL] Create Change Request: {e}")
+
 
 if __name__ == "__main__":
     print("Starting Verification...")

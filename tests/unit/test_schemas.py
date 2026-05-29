@@ -1,4 +1,5 @@
 """Tests for app.schemas.models module."""
+
 import pytest
 from datetime import datetime
 

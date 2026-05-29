@@ -1,4 +1,5 @@
 """Tests for app.core.sse_manager module."""
+
 import pytest
 from unittest.mock import MagicMock
 

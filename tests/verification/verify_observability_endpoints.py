@@ -26,15 +26,16 @@ sys.modules["app.core.security"] = security_mock
 # Now import the router
 from app.api.routers.integrations import router
 
+
 class TestObservabilityEndpoints(unittest.TestCase):
     def setUp(self):
         # Create a minimal app
         self.app = FastAPI()
         self.app.include_router(router, prefix="/api/v1/integrations")
         self.client = TestClient(self.app)
-        
+
         # Override dependency on the app/router
-        # Since we mocked the module 'app.core.security' and its verify_token, 
+        # Since we mocked the module 'app.core.security' and its verify_token,
         # the router definition used that mock as a default value for Depends().
         # However, FastAPI evaluates Depends at definition time.
         # Let's ensure the overrides are set just in case.
@@ -42,14 +43,10 @@ class TestObservabilityEndpoints(unittest.TestCase):
 
     def test_datadog_config_flow(self):
         # 1. Post Config
-        payload = {
-            "api_key": "1234567890",
-            "app_key": "abcdefghij",
-            "site": "datadoghq.eu"
-        }
+        payload = {"api_key": "1234567890", "app_key": "abcdefghij", "site": "datadoghq.eu"}
         res = self.client.post("/api/v1/integrations/datadog/config", json=payload)
         self.assertEqual(res.status_code, 200)
-        
+
         # 2. Get Config
         res = self.client.get("/api/v1/integrations/datadog/config")
         self.assertEqual(res.status_code, 200)
@@ -64,11 +61,11 @@ class TestObservabilityEndpoints(unittest.TestCase):
         payload = {
             "base_url": "http://my-prom:9090",
             "auth_type": "bearer",
-            "bearer_token": "secret-token-value"
+            "bearer_token": "secret-token-value",
         }
         res = self.client.post("/api/v1/integrations/prometheus/config", json=payload)
         self.assertEqual(res.status_code, 200)
-        
+
         # 2. Get Config
         res = self.client.get("/api/v1/integrations/prometheus/config")
         self.assertEqual(res.status_code, 200)
@@ -77,6 +74,7 @@ class TestObservabilityEndpoints(unittest.TestCase):
         self.assertEqual(data.get("auth_type"), "bearer")
         self.assertTrue(data.get("bearer_token", "").startswith("****"))
         print("PASS: Prometheus config flow")
+
 
 if __name__ == "__main__":
     unittest.main()

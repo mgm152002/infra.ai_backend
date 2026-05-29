@@ -1,4 +1,5 @@
 """Shared pytest fixtures for infra-ai-backend tests."""
+
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,8 +14,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # --- Mock Supabase client ---
 
+
 class MockSupabaseResponse:
     """Mimics Supabase query response."""
+
     def __init__(self, data=None, count=None):
         self.data = data or []
         self.count = count
@@ -22,6 +25,7 @@ class MockSupabaseResponse:
 
 class MockSupabaseQuery:
     """Chainable mock for Supabase query builder."""
+
     def __init__(self, return_data=None):
         self._return_data = return_data or []
 
@@ -70,6 +74,7 @@ class MockSupabaseQuery:
 
 class MockSupabaseTable:
     """Mock for supabase.table() that returns a chainable query."""
+
     def __init__(self, return_data=None):
         self._return_data = return_data
 
@@ -79,6 +84,7 @@ class MockSupabaseTable:
 
 class MockSupabaseClient:
     """Full mock Supabase client."""
+
     def __init__(self, return_data=None):
         self._return_data = return_data or []
 
@@ -98,12 +104,15 @@ def mock_supabase():
 @pytest.fixture
 def mock_supabase_with_data():
     """Factory fixture to create a mock Supabase client with specific return data."""
+
     def _factory(data):
         return MockSupabaseClient(return_data=data)
+
     return _factory
 
 
 # --- Auth fixtures ---
+
 
 @pytest.fixture
 def mock_verify_token():
@@ -122,6 +131,7 @@ def authenticated_headers():
 
 
 # --- LLM fixtures ---
+
 
 @pytest.fixture
 def mock_llm():
@@ -142,6 +152,7 @@ def mock_call_llm():
 
 
 # --- Settings fixture ---
+
 
 @pytest.fixture
 def mock_settings():
