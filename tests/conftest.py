@@ -11,8 +11,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# --- Mock environment variables BEFORE any app imports ---
+import os
 
-# --- Mock Supabase client ---
+os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
+os.environ.setdefault("SUPABASE_KEY", "test-key")
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("SQS_QUEUE_NAME", "test-queue")
+
+# --- Mock Supabase client at module level ---
 
 
 class MockSupabaseResponse:
@@ -72,27 +79,33 @@ class MockSupabaseQuery:
         return self
 
 
-class MockSupabaseTable:
-    """Mock for supabase.table() that returns a chainable query."""
-
-    def __init__(self, return_data=None):
-        self._return_data = return_data
-
-    def __call__(self, table_name):
-        return MockSupabaseQuery(self._return_data)
-
-
 class MockSupabaseClient:
     """Full mock Supabase client."""
 
     def __init__(self, return_data=None):
         self._return_data = return_data or []
+        self.auth = MagicMock()
 
     def table(self, table_name):
         return MockSupabaseQuery(self._return_data)
 
     def from_(self, table_name):
         return MockSupabaseQuery(self._return_data)
+
+
+# Patch create_client before any app imports
+_patch = patch(
+    "supabase.create_client",
+    return_value=MockSupabaseClient()
+)
+_patch.start()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mock_supabase_client():
+    """Ensure supabase client is mocked for entire test session."""
+    yield
+    _patch.stop()
 
 
 @pytest.fixture
