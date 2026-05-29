@@ -1,43 +1,27 @@
 """Shared pytest fixtures for infra-ai-backend tests."""
 
-import os
-import sys
-from pathlib import Path
+import pytest
 from unittest.mock import MagicMock, patch
 
-# Ensure project root is on sys.path
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# --- Mock Supabase.create_client AFTER the real module loads ---
 
-# --- CRITICAL: Set env vars BEFORE any imports ---
+_create_client_patch = None
 
-os.environ["SUPABASE_URL"] = "https://test.supabase.co"
-os.environ["SUPABASE_KEY"] = "test-key"
-os.environ["AWS_REGION"] = "us-east-1"
-os.environ["SQS_QUEUE_NAME"] = "test-queue"
-os.environ["ENCRYPTION_KEY"] = "dGVzdC1rZXktZm9yLXRlc3Rpbmctb25seS0xMjM0NTY3OA=="
 
-# --- CRITICAL: Mock missing dependencies BEFORE importing app ---
+def pytest_configure(config):
+    """Called before test collection - mock supabase.create_client."""
+    global _create_client_patch
+    _create_client_patch = patch(
+        "supabase.create_client",
+        return_value=MagicMock(),
+    )
+    _create_client_patch.start()
 
-# Mock pinecone_plugins (not installed in CI)
-_pinecone_plugins_mock = MagicMock()
-_pinecone_plugins_mock.assistant = MagicMock()
-_pinecone_plugins_mock.assistant.models = MagicMock()
-_pinecone_plugins_mock.assistant.models.chat = MagicMock()
-_pinecone_plugins_mock.assistant.models.chat.Message = MagicMock
 
-sys.modules["pinecone_plugins"] = _pinecone_plugins_mock
-sys.modules["pinecone_plugins.assistant"] = _pinecone_plugins_mock.assistant
-sys.modules["pinecone_plugins.assistant.models"] = _pinecone_plugins_mock.assistant.models
-sys.modules["pinecone_plugins.assistant.models.chat"] = _pinecone_plugins_mock.assistant.models.chat
-
-# Mock langchain_openai (optional dependency)
-_langchain_mock = MagicMock()
-_langchain_mock.ChatOpenAI = MagicMock
-sys.modules["langchain_openai"] = _langchain_mock
-
-# --- Mock Supabase classes ---
+def pytest_unconfigure(config):
+    """Called after all tests complete."""
+    if _create_client_patch:
+        _create_client_patch.stop()
 
 
 class MockSupabaseResponse:
@@ -109,54 +93,6 @@ class MockSupabaseClient:
 
     def from_(self, table_name):
         return MockSupabaseQuery(self._return_data)
-
-
-def _create_mock_client(*args, **kwargs):
-    """Factory function for mock Supabase client."""
-    return MockSupabaseClient()
-
-
-# --- Apply mocks BEFORE importing anything from app ---
-
-# Patch 1: supabase.create_client function
-_supabase_create_patch = patch("supabase.create_client", side_effect=_create_mock_client)
-_supabase_create_patch.start()
-
-# Patch 2: supabase.Client class directly
-_supabase_client_patch = patch("supabase.Client", MockSupabaseClient)
-_supabase_client_patch.start()
-
-# Patch 3: The module where database.py imports from
-_db_module_patch = patch("app.core.database.create_client", side_effect=_create_mock_client)
-_db_module_patch.start()
-
-# Now safe to import pytest
-import pytest  # noqa: E402
-
-
-def pytest_configure(config):
-    """Called before test collection - ensure mocks are in place."""
-    # Re-apply patches to ensure they're active
-    if not _supabase_create_patch.is_local:
-        _supabase_create_patch.start()
-    if not _supabase_client_patch.is_local:
-        _supabase_client_patch.start()
-    if not _db_module_patch.is_local:
-        _db_module_patch.start()
-
-
-def pytest_unconfigure(config):
-    """Called after all tests complete."""
-    _supabase_create_patch.stop()
-    _supabase_client_patch.stop()
-    _db_module_patch.stop()
-
-
-@pytest.fixture(scope="session", autouse=True)
-def setup_mocks():
-    """Ensure mocks stay active for entire test session."""
-    yield
-    # Mocks stopped in pytest_unconfigure
 
 
 @pytest.fixture
