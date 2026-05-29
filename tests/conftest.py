@@ -18,6 +18,25 @@ os.environ["AWS_REGION"] = "us-east-1"
 os.environ["SQS_QUEUE_NAME"] = "test-queue"
 os.environ["ENCRYPTION_KEY"] = "dGVzdC1rZXktZm9yLXRlc3Rpbmctb25seS0xMjM0NTY3OA=="
 
+# --- CRITICAL: Mock missing dependencies BEFORE importing app ---
+
+# Mock pinecone_plugins (not installed in CI)
+_pinecone_plugins_mock = MagicMock()
+_pinecone_plugins_mock.assistant = MagicMock()
+_pinecone_plugins_mock.assistant.models = MagicMock()
+_pinecone_plugins_mock.assistant.models.chat = MagicMock()
+_pinecone_plugins_mock.assistant.models.chat.Message = MagicMock
+
+sys.modules["pinecone_plugins"] = _pinecone_plugins_mock
+sys.modules["pinecone_plugins.assistant"] = _pinecone_plugins_mock.assistant
+sys.modules["pinecone_plugins.assistant.models"] = _pinecone_plugins_mock.assistant.models
+sys.modules["pinecone_plugins.assistant.models.chat"] = _pinecone_plugins_mock.assistant.models.chat
+
+# Mock langchain_openai (optional dependency)
+_langchain_mock = MagicMock()
+_langchain_mock.ChatOpenAI = MagicMock
+sys.modules["langchain_openai"] = _langchain_mock
+
 # --- Mock Supabase classes ---
 
 
