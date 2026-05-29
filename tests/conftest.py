@@ -108,9 +108,7 @@ _supabase_client_patch = patch("supabase.Client", MockSupabaseClient)
 _supabase_client_patch.start()
 
 # Patch 3: The module where database.py imports from
-_db_module_patch = patch(
-    "app.core.database.create_client", side_effect=_create_mock_client
-)
+_db_module_patch = patch("app.core.database.create_client", side_effect=_create_mock_client)
 _db_module_patch.start()
 
 # Now safe to import pytest

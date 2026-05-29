@@ -1,4 +1,5 @@
 """Tests for app.services.rca_service module."""
+
 import sys
 from unittest.mock import MagicMock, patch
 
