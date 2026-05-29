@@ -21,6 +21,9 @@ os.environ["SUPABASE_KEY"] = "test-key"
 os.environ["AWS_REGION"] = "us-east-1"
 os.environ["SQS_QUEUE_NAME"] = "test-queue"
 os.environ["ENCRYPTION_KEY"] = "dGVzdC1rZXktZm9yLXRlc3Rpbmctb25seS0xMjM0NTY3OA=="
+os.environ["Pinecone_Api_Key"] = "test-pinecone-key"
+os.environ["PINECONE_API_KEY"] = "test-pinecone-key"
+os.environ["openrouter"] = "test-openrouter-key"
 
 # Mock pinecone_plugins
 _pinecone_mock = MagicMock()
