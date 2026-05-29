@@ -416,6 +416,10 @@ Description: {incident.get('description', 'N/A')}
     # Call LLM to generate comprehensive problem record
     from app.core.llm import call_llm
     
+    resolution_steps_text = (
+        "\n".join(resolution_steps[:10]) if resolution_steps else "No resolution steps available"
+    )
+
     prompt = f"""
 Create a Problem Record JSON for this incident. 
 
@@ -427,7 +431,7 @@ RCA Report (use this to extract root cause and resolution):
 {rca_content[:3000] if rca_content else 'No RCA available'}
 
 Resolution Steps:
-{"\n".join(resolution_steps[:10]) if resolution_steps else 'No resolution steps available'}
+{resolution_steps_text}
 
 Output a valid JSON object with these exact fields (use plain text, no markdown):
 {{"title": "...", "description": "...", "root_cause": "...", "workaround": "...", "permanent_fix": "...", "priority": "..."}}
