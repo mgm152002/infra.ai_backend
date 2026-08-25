@@ -31,22 +31,36 @@ The backend centers on a FastAPI service that accepts chat and incident traffic,
 ```mermaid
 flowchart LR
     EventGen["External Event Generator"] --> IncidentQueue["sqs_incident_queue"]
+
     Frontend["Frontend"] -->|"Chat request"| Backend["Main Backend"]
     Backend -->|"SSE connection"| Frontend
+
     IncidentQueue -->|"Polling"| Backend
+
     Backend -->|"enqueue chat_request"| ChatQueue["chat_queue"]
     Backend -->|"enqueue incidents"| RMQ["RMQ"]
-    Backend <-->|"Pub/sub"| Redis["Redis"]
+
+    Backend <-->|"Pub/Sub"| Redis["Redis"]
+
     Backend --> Vault["Vault"]
     Backend --> DB["DB"]
-    Worker1["Worker 1"] -->|"pub"| Redis
-    Worker2["Worker 2"] -->|"pub"| Redis
-    Worker3["Worker 3"] -->|"pub"| Redis
-    Redis --> DB
+
+    Worker1["Worker 1"] -->|"publish events"| Redis
+    Worker2["Worker 2"] -->|"publish events"| Redis
+    Worker3["Worker 3"] -->|"publish events"| Redis
+
+    Worker1 -->|"persist results"| DB
+    Worker2 -->|"persist results"| DB
+    Worker3 -->|"persist results"| DB
+
+    Redis -->|"real-time events"| Backend
+    Backend -->|"SSE"| Frontend
+
     Vault --> Worker1
     Vault --> Worker2
     Vault --> Worker3
-    RMQ -->|"polling"| Worker3
+
+    RMQ -->|"consume"| Worker3
 ```
 
 ### Runtime responsibilities
