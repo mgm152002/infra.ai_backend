@@ -41,7 +41,7 @@ def test_collect_route_paths_prefers_effective_route_contexts(monkeypatch):
     """Effective contexts retain prefixes from included routers."""
     from types import SimpleNamespace
 
-    import tests.route_paths as route_paths
+    from tests import route_paths
 
     app = SimpleNamespace(routes=[SimpleNamespace()])
     monkeypatch.setattr(

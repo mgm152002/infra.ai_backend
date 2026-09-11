@@ -13,31 +13,32 @@ def _context_path(context):
     return getattr(getattr(context, "starlette_route", None), "path", None)
 
 
-def collect_route_paths(app):
-    """Collect paths from direct routes and included routers."""
+def _route_paths(route):
+    if hasattr(route, "path"):
+        return [route.path]
+
     if iter_route_contexts is not None:
+        context_paths = [
+            path
+            for context in iter_route_contexts([route])
+            if (path := _context_path(context)) is not None
+        ]
+        if context_paths:
+            return context_paths
+
+    if hasattr(route, "effective_route_contexts"):
         return [
             path
-            for context in iter_route_contexts(app.routes)
+            for context in route.effective_route_contexts()
             if (path := _context_path(context)) is not None
         ]
 
-    paths = []
-    for route in app.routes:
-        if hasattr(route, "path"):
-            paths.append(route.path)
-        elif hasattr(route, "effective_route_contexts"):
-            paths.extend(
-                path
-                for context in route.effective_route_contexts()
-                if (path := _context_path(context)) is not None
-            )
-        elif hasattr(route, "routes"):
-            for subroute in route.routes:
-                if hasattr(subroute, "path"):
-                    paths.append(subroute.path)
-        elif hasattr(route, "original_router"):
-            for subroute in route.original_router.routes:
-                if hasattr(subroute, "path"):
-                    paths.append(subroute.path)
-    return paths
+    child_routes = getattr(route, "routes", None)
+    if child_routes is None:
+        child_routes = getattr(getattr(route, "original_router", None), "routes", [])
+    return [subroute.path for subroute in child_routes if hasattr(subroute, "path")]
+
+
+def collect_route_paths(app):
+    """Collect paths from direct routes and included routers."""
+    return [path for route in app.routes for path in _route_paths(route)]
