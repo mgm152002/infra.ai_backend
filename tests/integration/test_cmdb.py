@@ -1,5 +1,6 @@
 """Tests for CMDB endpoints."""
 
+
 class TestCMDBEndpoints:
     """Test CMDB CRUD endpoints."""
 

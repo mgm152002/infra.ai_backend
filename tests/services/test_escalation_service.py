@@ -1,5 +1,6 @@
 """Tests for the escalation monitoring service."""
 
+
 class TestEscalationService:
     """Test escalation monitoring service."""
 

@@ -1,5 +1,6 @@
 """Tests for app.schemas.models module."""
 
+
 class TestSchemas:
     """Test Pydantic schema models."""
 
