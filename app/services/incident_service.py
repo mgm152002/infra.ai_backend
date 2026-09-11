@@ -2240,7 +2240,9 @@ SRE INVESTIGATION AND REMEDIATION REQUIREMENTS
     try:
         # Initialize LLM
         from app.core.llm import get_llm as _get_llm
-        from main import infra_automation_ai as _infra_automation_ai
+        from app.services.infrastructure_automation import (
+            infra_automation_ai as _infra_automation_ai,
+        )
         tool_llm = _get_llm()
 
         # ------------------------------------------------------------------ #
