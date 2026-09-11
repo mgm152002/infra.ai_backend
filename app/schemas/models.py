@@ -1,4 +1,4 @@
-from typing import Union, Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 from pydantic.networks import IPvAnyAddress
 from datetime import datetime
@@ -42,6 +42,9 @@ class CMDBItemUpdate(BaseModel):
     os: Optional[str] = None
     type: Optional[str] = None
     description: Optional[str] = None
+    sys_id: Optional[str] = None
+    source: Optional[str] = None
+    raw_data: Optional[Dict[str, Any]] = None
     service_id: Optional[str] = None
     fqdn: Optional[str] = None
 
@@ -102,10 +105,11 @@ class Incident(BaseModel):
     # NOTE: This model is used by /incidentAdd.
     # Keep fields backward-compatible with existing UI flows, while adding
     # optional external-* fields to support PagerDuty (and other sources).
-    id: Optional[Union[int, str]] = None
+    id: Optional[str] = None
 
     # Core (existing)
     short_description: str
+    description: Optional[str] = None
     tag_id: Optional[str] = None
     state: Optional[str] = None
 
@@ -131,8 +135,56 @@ class Incident(BaseModel):
     external_created_at: Optional[datetime] = None
     external_updated_at: Optional[datetime] = None
     external_payload: Optional[Dict[str, Any]] = None
+    alert_type_id: Optional[int] = None
     # Alert type for escalation matrix (e.g., critical, high, medium, low)
     alert_type: Optional[str] = None
+
+
+class AlertType(BaseModel):
+    id: Optional[int] = None
+    name: str
+    description: Optional[str] = None
+    priority: str = "medium"
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class CreateAlertType(BaseModel):
+    name: str
+    description: Optional[str] = None
+    priority: str = "medium"
+
+
+class UpdateAlertType(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    priority: Optional[str] = None
+
+
+class EscalationRule(BaseModel):
+    id: Optional[int] = None
+    alert_type_id: int
+    level: int
+    wait_time_minutes: int
+    contact_type: str
+    contact_destination: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class CreateEscalationRule(BaseModel):
+    alert_type_id: int
+    level: int
+    wait_time_minutes: int
+    contact_type: str
+    contact_destination: str
+
+
+class UpdateEscalationRule(BaseModel):
+    level: Optional[int] = None
+    wait_time_minutes: Optional[int] = None
+    contact_type: Optional[str] = None
+    contact_destination: Optional[str] = None
 
 
 class AlertTypeEscalation(BaseModel):

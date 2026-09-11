@@ -1,9 +1,5 @@
 """Tests for CMDB endpoints."""
 
-import pytest
-from unittest.mock import patch, MagicMock
-
-
 class TestCMDBEndpoints:
     """Test CMDB CRUD endpoints."""
 
@@ -48,3 +44,21 @@ class TestCMDBEndpoints:
 
         routes = [r.path for r in app.routes]
         assert "/uploadCMDB" in routes
+
+    def test_cmdb_router_preserves_the_cmdb_and_service_contract(self):
+        """The extracted router must expose every moved CMDB/service route."""
+        from app.api.routers.cmdb import router
+
+        routes = {(route.path, method) for route in router.routes for method in route.methods}
+        assert ("/cmdb", "GET") in routes
+        assert ("/cmdb", "POST") in routes
+        assert ("/cmdb/{tag_id}", "PUT") in routes
+        assert ("/cmdb/{tag_id}", "DELETE") in routes
+        assert ("/cmdb/by-service", "GET") in routes
+        assert ("/cmdb/search/{query}", "GET") in routes
+        assert ("/services", "GET") in routes
+        assert ("/services", "POST") in routes
+        assert ("/services/{service_id}", "GET") in routes
+        assert ("/services/{service_id}", "PUT") in routes
+        assert ("/services/{service_id}", "DELETE") in routes
+        assert ("/services/{service_id}/hosts", "GET") in routes
