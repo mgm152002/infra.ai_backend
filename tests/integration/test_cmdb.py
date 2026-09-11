@@ -1,5 +1,7 @@
 """Tests for CMDB endpoints."""
 
+from tests.route_paths import collect_route_paths
+
 
 class TestCMDBEndpoints:
     """Test CMDB CRUD endpoints."""
@@ -8,42 +10,42 @@ class TestCMDBEndpoints:
         """CMDB endpoint should be registered."""
         from main import app
 
-        routes = [route.path for route in app.routes if hasattr(route, "path")]
+        routes = collect_route_paths(app)
         assert "/cmdb" in routes
 
     def test_cmdb_by_service_endpoint_exists(self):
         """CMDB by-service endpoint should be registered."""
         from main import app
 
-        routes = [route.path for route in app.routes if hasattr(route, "path")]
+        routes = collect_route_paths(app)
         assert "/cmdb/by-service" in routes
 
     def test_cmdb_search_endpoint_exists(self):
         """CMDB search endpoint should be registered."""
         from main import app
 
-        routes = [route.path for route in app.routes if hasattr(route, "path")]
+        routes = collect_route_paths(app)
         assert any("cmdb/search" in r for r in routes)
 
     def test_services_endpoint_exists(self):
         """Services endpoint should be registered."""
         from main import app
 
-        routes = [route.path for route in app.routes if hasattr(route, "path")]
+        routes = collect_route_paths(app)
         assert "/services" in routes
 
     def test_services_hosts_endpoint_exists(self):
         """Services hosts endpoint should be registered."""
         from main import app
 
-        routes = [route.path for route in app.routes if hasattr(route, "path")]
+        routes = collect_route_paths(app)
         assert any("services" in r and "hosts" in r for r in routes)
 
     def test_upload_cmdb_endpoint_exists(self):
         """Upload CMDB endpoint should be registered."""
         from main import app
 
-        routes = [route.path for route in app.routes if hasattr(route, "path")]
+        routes = collect_route_paths(app)
         assert "/uploadCMDB" in routes
 
     def test_cmdb_router_preserves_the_cmdb_and_service_contract(self):
