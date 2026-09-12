@@ -25,6 +25,7 @@ import requests
 from bs4 import BeautifulSoup
 from botocore.exceptions import ClientError
 from fastapi import HTTPException, status
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool, Tool, tool
 from requests.auth import HTTPBasicAuth
 from tavily import TavilyClient
@@ -36,7 +37,7 @@ except ImportError:
 
 from app.core.database import supabase
 from app.core.llm import call_llm, get_llm
-from app.schemas.models import Aws, IncidentMail
+from app.schemas.models import Aws, IncidentMail, Snow_key
 from app.services.knowledge_service import query_knowledge_base
 from integrations.confluence import confluence_get_page as confluence_get_page_impl
 from integrations.confluence import confluence_search_pages as confluence_search_pages_impl
@@ -368,9 +369,6 @@ def power_status_tool(Aws: Aws):
         if "stopped" in status.lower():
             action = f"Instance {Aws['']} is stopped. Attempting to start it."
             try:
-                print(
-                    f"--- execute_plan_generator: Attempting plan_item: Action: {plan_item.action}, Desc: {plan_item.description}"
-                )
                 ec2.start_instances(InstanceIds=[Aws["instance_id"]])
                 action += " Instance has been started successfully."
             except Exception as e:

@@ -10,8 +10,7 @@ def test_main_exposes_the_existing_route_contract():
 
     contract = collect_route_contract(app)
     expected = {
-        tuple(item)
-        for item in json.loads(Path("tests/fixtures/route_contract.json").read_text())
+        tuple(item) for item in json.loads(Path("tests/fixtures/route_contract.json").read_text())
     }
     required = {
         ("/chat", "POST"),
