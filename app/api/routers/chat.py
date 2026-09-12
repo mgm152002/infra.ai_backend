@@ -1,10 +1,5 @@
-"""Chat API router.
+"""Chat API routes."""
 
-Extracts chat-related endpoints from the monolithic main.py.
-Note: This router depends on chat tools and LLM configuration from main.py.
-For now, it imports from main where needed - a future refactor could move
-the chat tool definitions here as well.
-"""
 import json
 import hashlib
 import uuid
@@ -19,15 +14,24 @@ from pydantic import BaseModel
 import jwt
 
 from app.core.database import supabase
+from app.core.llm import call_llm
 from app.core.security import verify_token
 from app.core.logger import logger
+from app.services.agent_tools import (
+    CHAT_SYSTEM_PROMPT,
+    TOOLS_REQUIRING_MAIL,
+    llm_with_tools,
+    tool_mapping,
+)
+from app.services.chat_service import process_chat_request
 
 router = APIRouter()
 security = HTTPBearer()
 
 # Redis connection for async chat jobs
 import os
-r = redis.Redis(host='localhost', port=6379, db=0)
+
+r = redis.Redis(host="localhost", port=6379, db=0)
 CHAT_JOB_TTL_SECONDS = 60 * 60  # 1 hour
 
 
@@ -55,7 +59,7 @@ ZQIDAQAB
 def _verify_clerk_token(credentials: HTTPAuthorizationCredentials) -> dict:
     """Verify Clerk JWT and return decoded token."""
     token = credentials.credentials
-    return jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=['RS256'])
+    return jwt.decode(token, key=CLERK_PUBLIC_KEY, algorithms=["RS256"])
 
 
 def _chat_job_redis_key(job_id: str) -> str:
@@ -75,7 +79,9 @@ def _store_chat_history(
     try:
         user_id = None
         try:
-            user_response = supabase.table("Users").select("id").eq("email", mail).limit(1).execute()
+            user_response = (
+                supabase.table("Users").select("id").eq("email", mail).limit(1).execute()
+            )
             if user_response.data:
                 user_id = user_response.data[0]["id"]
         except Exception as e:
@@ -102,35 +108,34 @@ def _store_chat_history(
 def chat(message: Mesage, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
     try:
         res = _verify_clerk_token(credentials)
-        mail = res['email']
+        mail = res["email"]
     except jwt.DecodeError as e:
         print(e)
         return {"error": e}
 
-    from main import process_chat_request
-    return process_chat_request(mail=mail, message_content=message.content, session_id=message.session_id)
+    return process_chat_request(
+        mail=mail, message_content=message.content, session_id=message.session_id
+    )
 
 
 @router.post("/chat/stream")
-async def chat_stream(message: Mesage, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]):
+async def chat_stream(
+    message: Mesage, credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]
+):
     try:
         res = _verify_clerk_token(credentials)
-        mail = res['email']
+        mail = res["email"]
     except jwt.DecodeError as e:
         print(e)
         return {"error": e}
 
-    from main import (
-        CHAT_SYSTEM_PROMPT, llm_with_tools, tool_mapping,
-        TOOLS_REQUIRING_MAIL, call_llm, _store_chat_history as store_hist
-    )
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     async def generate():
         system_message = SystemMessage(content=CHAT_SYSTEM_PROMPT)
-        previous_data = getattr(message, 'previous_data', None)
-        format_request = getattr(message, 'format_request', None)
-        previous_data_type = getattr(message, 'previous_data_type', None)
+        previous_data = getattr(message, "previous_data", None)
+        format_request = getattr(message, "format_request", None)
+        previous_data_type = getattr(message, "previous_data_type", None)
 
         context_instruction = ""
         if previous_data is not None and format_request:
@@ -152,7 +157,11 @@ async def chat_stream(message: Mesage, credentials: Annotated[HTTPAuthorizationC
             for tool_call in tool_calls:
                 tool_name = (tool_call.get("name") or "").lower()
                 tool = tool_mapping.get(tool_name)
-                tool_args = dict(tool_call.get("args") or {}) if isinstance(tool_call.get("args"), dict) else {}
+                tool_args = (
+                    dict(tool_call.get("args") or {})
+                    if isinstance(tool_call.get("args"), dict)
+                    else {}
+                )
 
                 if tool_name in TOOLS_REQUIRING_MAIL:
                     tool_args["mail"] = mail
@@ -162,15 +171,19 @@ async def chat_stream(message: Mesage, credentials: Annotated[HTTPAuthorizationC
                 else:
                     tool_output = tool.invoke(tool_args)
 
-                all_tool_calls.append({
-                    "name": tool_name,
-                    "args": tool_args,
-                    "output": tool_output,
-                })
+                all_tool_calls.append(
+                    {
+                        "name": tool_name,
+                        "args": tool_args,
+                        "output": tool_output,
+                    }
+                )
 
                 yield f"data: {json.dumps({'type': 'tool_call', 'tool': {'name': tool_name, 'args': tool_args, 'output': str(tool_output)}})}\n\n"
 
-                tool_output_str = tool_output if isinstance(tool_output, str) else json.dumps(tool_output)
+                tool_output_str = (
+                    tool_output if isinstance(tool_output, str) else json.dumps(tool_output)
+                )
                 messages.append(ToolMessage(content=tool_output_str, tool_call_id=tool_call["id"]))
 
         ex2 = final_model_message if final_model_message is not None else ""
@@ -179,18 +192,23 @@ async def chat_stream(message: Mesage, credentials: Annotated[HTTPAuthorizationC
             reformat_context = f"\n\nThe user specifically asked to format the data as: {format_request}.\nHere is the raw data that should be formatted: {json.dumps(previous_data, indent=2)}"
 
         result_text = call_llm(
-            f'''generate a response for the given context {ex2} make it short and give only important details related to {message.content} in sentences dont add unnecessary , or symbols or extra spaces use the {ex2} to provide details and if it failed give details why it failed'''
+            f"""generate a response for the given context {ex2} make it short and give only important details related to {message.content} in sentences dont add unnecessary , or symbols or extra spaces use the {ex2} to provide details and if it failed give details why it failed"""
             + reformat_context
         )
 
         import re
-        incident_match = re.search(r'incident\s+(\w+)', message.content, re.IGNORECASE)
+
+        incident_match = re.search(r"incident\s+(\w+)", message.content, re.IGNORECASE)
         if incident_match:
             inc_number = incident_match.group(1)
             try:
-                incident_response = supabase.table("Incidents").select("id").eq("inc_number", inc_number).execute()
+                incident_response = (
+                    supabase.table("Incidents").select("id").eq("inc_number", inc_number).execute()
+                )
                 if incident_response.data:
-                    supabase.table("Incidents").update({"state": "completed"}).eq("inc_number", inc_number).execute()
+                    supabase.table("Incidents").update({"state": "completed"}).eq(
+                        "inc_number", inc_number
+                    ).execute()
             except Exception as e:
                 print(f"Error updating incident status: {str(e)}")
 
@@ -206,7 +224,7 @@ async def chat_stream(message: Mesage, credentials: Annotated[HTTPAuthorizationC
 
         chunk_size = 20
         for i in range(0, len(result_text), chunk_size):
-            chunk = result_text[i:i + chunk_size]
+            chunk = result_text[i : i + chunk_size]
             yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -223,7 +241,7 @@ def enqueue_chat(
 
     try:
         res = _verify_clerk_token(credentials)
-        mail = res['email']
+        mail = res["email"]
     except jwt.DecodeError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -241,14 +259,14 @@ def enqueue_chat(
     message_body = json.dumps(body)
 
     session = boto3.Session(
-        aws_access_key_id=os.getenv('access_key'),
-        aws_secret_access_key=os.getenv('secrete_access'),
-        region_name='ap-south-1'
+        aws_access_key_id=os.getenv("access_key"),
+        aws_secret_access_key=os.getenv("secrete_access"),
+        region_name="ap-south-1",
     )
     chat_queue_name = os.getenv("CHAT_QUEUE_NAME", "ChatqueueAsync")
 
     try:
-        sqsqueue = session.resource('sqs').get_queue_by_name(QueueName=chat_queue_name)
+        sqsqueue = session.resource("sqs").get_queue_by_name(QueueName=chat_queue_name)
         sqsqueue.send_message(MessageBody=message_body)
     except Exception as e:
         raise HTTPException(
@@ -294,7 +312,9 @@ async def get_chat_history(
 
         response = (
             supabase.table("ChatHistory")
-            .select("id, email, message_content, response_text, is_async, job_id, created_at, raw_result")
+            .select(
+                "id, email, message_content, response_text, is_async, job_id, created_at, raw_result"
+            )
             .eq("user_id", user_id)
             .order("created_at", desc=True)
             .range(start, end)
@@ -313,12 +333,18 @@ async def create_chat_session(
     try:
         user_id = user_data["user_id"]
         title = session_data.title or "New Chat"
-        response = supabase.table("ChatSessions").insert({
-            "user_id": user_id,
-            "title": title,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-        }).execute()
+        response = (
+            supabase.table("ChatSessions")
+            .insert(
+                {
+                    "user_id": user_id,
+                    "title": title,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            .execute()
+        )
         return {"response": response.data[0]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -354,10 +380,13 @@ async def update_chat_session(
     try:
         if not update_data.title:
             return {"message": "No changes"}
-        response = supabase.table("ChatSessions").update({
-            "title": update_data.title,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", session_id).eq("user_id", user_data["user_id"]).execute()
+        response = (
+            supabase.table("ChatSessions")
+            .update({"title": update_data.title, "updated_at": datetime.utcnow().isoformat()})
+            .eq("id", session_id)
+            .eq("user_id", user_data["user_id"])
+            .execute()
+        )
         if not response.data:
             raise HTTPException(status_code=404, detail="Session not found")
         return {"response": response.data[0]}
@@ -373,7 +402,9 @@ async def get_session_history(
     try:
         response = (
             supabase.table("ChatHistory")
-            .select("id, email, message_content, response_text, is_async, job_id, created_at, raw_result")
+            .select(
+                "id, email, message_content, response_text, is_async, job_id, created_at, raw_result"
+            )
             .eq("session_id", session_id)
             .order("created_at")
             .execute()
@@ -393,8 +424,16 @@ async def delete_chat_session(
 ):
     try:
         user_id = user_data["user_id"]
-        supabase.table("ChatHistory").delete().eq("session_id", session_id).eq("user_id", user_id).execute()
-        response = supabase.table("ChatSessions").delete().eq("id", session_id).eq("user_id", user_id).execute()
+        supabase.table("ChatHistory").delete().eq("session_id", session_id).eq(
+            "user_id", user_id
+        ).execute()
+        response = (
+            supabase.table("ChatSessions")
+            .delete()
+            .eq("id", session_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
         if not response.data:
             raise HTTPException(status_code=404, detail="Session not found")
         return {"status": "ok", "message": "Session deleted successfully"}
